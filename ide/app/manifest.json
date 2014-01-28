@@ -23,6 +23,7 @@
   "permissions": [
     "https://www.google-analytics.com/",
     "https://github.com/*",
+    "http://pajamallama0.syd.corp.google.com:8080/*",
     "clipboardRead",
     "clipboardWrite",
     {

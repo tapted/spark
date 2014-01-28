@@ -17,6 +17,7 @@ dependencies:
   crypto: any
   dquery: 0.5.3+7
   intl: any
+  js: any
   logging: any
   mime: any
   path: any
@@ -28,6 +29,9 @@ dependencies:
 dev_dependencies:
   args: any
   grinder: '>=0.5.0 <0.6.0'
+  tavern:
+    git:
+      url: git://github.com/tapted/tavern.git
 transformers:
 - polymer:
     entry_points: web/spark_polymer.html
