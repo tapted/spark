@@ -13,7 +13,7 @@ import 'package:polymer/polymer.dart' as polymer;
 // BUG(ussuri): https://github.com/dart-lang/spark/issues/500
 import 'packages/spark_widgets/spark_button/spark_button.dart';
 import 'packages/spark_widgets/spark_overlay/spark_overlay.dart';
-import 'packages/spark_widgets/spark_splitter/spark_splitter.dart';
+import 'packages/spark_widgets/spark_split_view/spark_split_view.dart';
 
 import 'spark.dart';
 import 'spark_polymer_ui.dart';
@@ -38,12 +38,16 @@ class SparkPolymerDialog implements SparkDialog {
       : _dialogElement = dialogElement {
     // TODO(ussuri): Encapsulate backdrop in SparkOverlay.
     _dialogElement.on['opened'].listen((event) {
-      var appModal = querySelector("#modalBackdrop");
-      appModal.style.display = event.detail ? "block" : "none";
+      SparkPolymer.backdropShowing = event.detail;
     });
   }
 
-  void show() => _dialogElement.toggle();
+  void show() {
+    if (!_dialogElement.opened) {
+      _dialogElement.toggle();
+      Timer.run(() => _dialogElement.applyFocus());
+    }
+  }
 
   // TODO(ussuri): Currently, this never gets called (the dialog closes in
   // another way). Make symmetrical when merging Polymer and non-Polymer.
@@ -55,9 +59,42 @@ class SparkPolymerDialog implements SparkDialog {
 class SparkPolymer extends Spark {
   SparkPolymerUI _ui;
 
+  Future<bool> openFolder() {
+    return _beforeSystemModal()
+        .then((_) => super.openFolder())
+        .then((_) => _systemModalComplete())
+        .catchError((e) => _systemModalComplete());
+  }
+
+  Future openFile() {
+    return _beforeSystemModal()
+        .then((_) => super.openFile())
+        .then((_) => _systemModalComplete())
+        .catchError((e) => _systemModalComplete());
+  }
+
+  static set backdropShowing(bool showing) {
+    var appModal = querySelector("#modalBackdrop");
+    appModal.style.display = showing ? "block" : "none";
+  }
+
+  static bool get backdropShowing {
+    var appModal = querySelector("#modalBackdrop");
+    return (appModal.style.display != "none");
+  }
+
   SparkPolymer._(bool developerMode)
       : _ui = document.querySelector('#topUi') as SparkPolymerUI,
-        super(developerMode);
+        super(developerMode) {
+    _ui.developerMode = developerMode;
+
+    // Prevent FOUC in our own way. Polymer recommended ways don't work
+    // (bug pending).
+    polymer.Polymer.onReady.then((_) {
+      // BUG: Without this delay, FOUC still happens. Probably a Polymer bug.
+      new Timer(new Duration(milliseconds: 500), unveil);
+    });
+  }
 
   @override
   Element getUIElement(String selectors) => _ui.getShadowDomElement(selectors);
@@ -99,7 +136,7 @@ class SparkPolymer extends Spark {
       if (position != null) {
         int value = int.parse(position, onError: (_) => 0);
         if (value != 0) {
-          (getUIElement('#splitter') as SparkSplitter).targetSize = value;
+          (getUIElement('#splitView') as dynamic).targetSize = value;
         }
       }
     });
@@ -119,8 +156,8 @@ class SparkPolymer extends Spark {
     // Listen for job manager events.
     jobManager.onChange.listen((JobManagerEvent event) {
       if (event.started) {
-          statusComponent.spinning = true;
-          statusComponent.progressMessage = event.job.name;
+        statusComponent.spinning = true;
+        statusComponent.progressMessage = event.job.name;
       } else if (event.finished) {
         statusComponent.spinning = false;
         statusComponent.progressMessage = null;
@@ -129,11 +166,8 @@ class SparkPolymer extends Spark {
 
     // Listen for editing area name change events.
     editorArea.onNameChange.listen((name) {
-      if (editorArea.shouldDisplayName) {
-        statusComponent.defaultMessage = name;
-      } else {
-        statusComponent.defaultMessage = null;
-      }
+      statusComponent.defaultMessage =
+          editorArea.shouldDisplayName ? name : null;
     });
   }
 
@@ -154,12 +188,12 @@ class SparkPolymer extends Spark {
     super.initToolbar();
 
     _bindButtonToAction('gitClone', 'git-clone');
-    _bindButtonToAction('openFolder', 'folder-open');
+    _bindButtonToAction('newProject', 'project-new');
     _bindButtonToAction('runButton', 'application-run');
   }
 
   @override
-  void buildMenu() {}
+  void buildMenu() => super.buildMenu();
 
   //
   // - End parts of the parent's ctor.
@@ -180,5 +214,26 @@ class SparkPolymer extends Spark {
       if (action.enabled) action.invoke();
     });
     button.active = action.enabled;
+  }
+
+  void unveil() {
+    _ui.classes.remove('veiled');
+    _ui.classes.add('unveiled');
+  }
+
+  Future<bool> _beforeSystemModal() {
+    Completer completer = new Completer();
+    backdropShowing = true;
+
+    Timer timer =
+        new Timer(new Duration(milliseconds: 100), () {
+          completer.complete();
+        });
+
+    return completer.future;
+  }
+
+  void _systemModalComplete() {
+    backdropShowing = false;
   }
 }

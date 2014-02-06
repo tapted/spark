@@ -2,6 +2,8 @@
 /* All rights reserved.  Use of this source code is governed by a BSD-style */
 /* license that can be found in the LICENSE file. */
 
+@import url("../common/spark_widget.css");
+
 :host {
   display: inline-block;
   white-space: nowrap;
@@ -11,7 +13,7 @@
 }
 
 .throbber {
-	opacity: 0;
+  opacity: 0;
   display: inline-block;
   color: #aaa;
   min-width: 26px;
@@ -29,9 +31,9 @@
 }
 
 .label {
-	text-overflow: ellipsis;
-  font-family: Helvetica, Sans-serif;
+  text-overflow: ellipsis;
   font-size: 14px;
+  font-family: Helvetica, sans-serif;
   font-weight: 500;
   color: #aaa;
   white-space: nowrap;
@@ -43,7 +45,6 @@
 }
 
 .default {
-
 }
 
 .progressStyle {
@@ -51,5 +52,4 @@
 }
 
 .temporary {
-
 }

@@ -9,10 +9,12 @@
 <link rel="import" href="packages/spark_widgets/spark_icon_button/spark_icon_button.html">
 <link rel="import" href="packages/spark_widgets/spark_menu_button/spark_menu_button.html">
 <link rel="import" href="packages/spark_widgets/spark_menu_item/spark_menu_item.html">
+<link rel="import" href="packages/spark_widgets/spark_menu_separator/spark_menu_separator.html">
 <link rel="import" href="packages/spark_widgets/spark_modal/spark_modal.html">
 <link rel="import" href="packages/spark_widgets/spark_overlay/spark_overlay.html">
-<link rel="import" href="packages/spark_widgets/spark_splitter/spark_splitter.html">
+<link rel="import" href="packages/spark_widgets/spark_split_view/spark_split_view.html">
 <link rel="import" href="packages/spark_widgets/spark_status/spark_status.html">
+<link rel="import" href="packages/spark_widgets/spark_suggest/spark_suggest_box.html">
 <link rel="import" href="packages/spark_widgets/spark_toolbar/spark_toolbar.html">
 
 <!--link rel="import" href="packages/polymer_elements/polymer_flex_layout/polymer_flex_panel.html"-->
@@ -27,16 +29,20 @@
     </style>
 
     <spark-toolbar id="toolbar" lightdom>
-      <spark-button id="gitClone" small primary>Git Clone...</spark-button>
-      <spark-button id="openFolder" small>Open Folder...</spark-button>
-      <spark-button id="runButton" small><i class="fa fa-play"></i> Run</spark-button>
+      <spark-button id="runButton" small primary>
+        <span class="glyphicon glyphicon-play"></span> Run
+      </spark-button>
+      <spark-button id="gitClone" small>Git Clone...</spark-button>
+      <spark-button id="newProject" small>New Project...</spark-button>
 
       <spark-status id="sparkStatus"></spark-status>
-      
-      <span id="saveStatus" class="titleFont"></span>
 
-      <div id="toolbarRight" class="titleFont">
-        <spark-menu-button id="hotdogMenuNew"
+      <div id="toolbarRight">
+        <spark-suggest-box id="searchBox" oracle="{{searchOracle}}"
+            placeholder="Search">
+        </spark-suggest-box>
+
+        <spark-menu-button id="mainMenu"
             src="images/menu.png"
             responsive="true"
             selected="0"
@@ -47,40 +53,35 @@
           </spark-menu-item>
           <spark-menu-item action-id="folder-open" iconsize=0 label="Open Folder...">
           </spark-menu-item>
+          <spark-menu-separator></spark-menu-separator>
+          <spark-menu-item action-id="project-new" iconsize=0 label="New Project...">
+          </spark-menu-item>
           <spark-menu-item action-id="git-clone" iconsize=0 label="Git Clone...">
           </spark-menu-item>
+          <spark-menu-separator></spark-menu-separator>
           <spark-menu-item action-id="settings" iconsize=0 label="Settings...">
           </spark-menu-item>
-          <spark-menu-item action-id="run-tests" iconsize=0 label="Run Tests">
-          </spark-menu-item>
+          <template if="{{developerMode}}">
+            <spark-menu-separator></spark-menu-separator>
+            <spark-menu-item action-id="run-tests" iconsize=0 label="Run Tests">
+            </spark-menu-item>
+          </template>
+          <spark-menu-separator></spark-menu-separator>
           <spark-menu-item action-id="help-about" iconsize=0 label="About Spark">
           </spark-menu-item>
         </spark-menu-button>
       </div>
     </spark-toolbar>
 
-    <!-- Temporarily switch back to div: most recent polymer-flex-panel
-      requires working external CSS linking.
-      TODO(ussuri): revert once external CSS linking is available
-      (don't forget to remove 'display: flex' in the CSS). -->
-    <!--polymer-flex-panel id="splitview"-->
-    <div id="splitview">
-      <div id="fileViewArea" min-size="100"></div>
-      <spark-splitter id="splitter" direction="left" onUpdate="{{onSplitterUpdate}}">
-      </spark-splitter>
-      <div id="editorArea" min-size="200"></div>
-    <!--/polymer-flex-panel-->
-    </div>
-
-    <!-- File context menu -->
-    <div id="file-item-context-menu" class="dropdown">
-      <div class="backdrop"></div>
-      <ul class="dropdown-menu" role="menu">
-      </ul>
-    </div>
+    <spark-split-view
+        id="splitView"
+        direction="left" splitterSize="6" splitterHandle="false"
+        onUpdate="{{onSplitterUpdate}}">
+      <content></content>
+    </spark-split-view>
 
     <!-- Delete File dialog -->
-    <spark-modal id="deleteDialog" class="spark-overlay-scale-slideup">
+    <spark-modal id="deleteDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-body">
         <p id="message"></p>
       </div>
@@ -88,168 +89,230 @@
         <spark-button overlay-toggle data-dismiss="modal">
           Cancel
         </spark-button>
-        <spark-button id="deleteOkButton" overlay-toggle primary focused
-            data-dismiss="modal">
+        <spark-button overlay-toggle primary autofocus data-dismiss="modal">
           Delete
         </spark-button>
       </div>
     </spark-modal>
 
-    <!-- Rename File dialog -->
-    <spark-overlay id="renameDialog" class="spark-overlay-scale-slideup">
+    <!-- Error dialog -->
+    <spark-modal id="errorDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-body">
-        <p>
-          File name: <input id="renameFileName" type="text" focused>
-        </p>
+        <div class="form-group">
+          <label id="errorTitle"></label>
+          <div id="errorMessage" class="help-block"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <spark-button id="errorClose" overlay-toggle primary autofocus data-dismiss="modal">
+          Close
+        </spark-button>
+      </div>
+    </spark-modal>
+
+    <!-- Rename File dialog -->
+    <spark-modal id="renameDialog" class="dialog spark-overlay-scale-slideup">
+      <div class="modal-header">
+        <a href="#" class="close" overlay-toggle>&times;</a>
+        <h4 class="modal-title">Rename</h4>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="renameFileName">New name</label>
+          <input id="renameFileName" type="text" class="form-control" autofocus>
+        </div>
       </div>
       <div class="modal-footer">
         <spark-button overlay-toggle data-dismiss="modal">
           Cancel
         </spark-button>
-        <spark-button id="renameOkButton" overlay-toggle primary
-            data-dismiss="modal">
+        <spark-button overlay-toggle primary data-dismiss="modal">
           Rename
         </spark-button>
       </div>
-    </spark-overlay>
+    </spark-modal>
 
-     <!-- New File dialog -->
-     <spark-overlay id="fileNewDialog" class="spark-overlay-scale-slideup">
-       <div class="modal-body">
-         <p>
-           File name: <input id="fileNewName" type="text" focused>
-         </p>
-       </div>
-       <div class="modal-footer">
-         <spark-button overlay-toggle data-dismiss="modal">
-           Cancel
-         </spark-button>
-         <spark-button id="fileNewOkButton" overlay-toggle primary
-             data-dismiss="modal">
-           Create
-         </spark-button>
-       </div>
-     </spark-overlay>
-
-     <!-- New Folder dialog -->
-    <spark-overlay id="folderNewDialog" class="spark-overlay-scale-slideup">
-      <div class="modal-body">
-        <p>
-          Folder name: <input id="folderName" type="text" focused>
-        </p>
-      </div>
-      <div class="modal-footer">
-        <spark-button data-dismiss="modal">
-          Cancel
-        </spark-button>
-        <spark-button id="folderNewOkButton" primary
-            data-dismiss="modal">Create</spark-button>
-      </div>
-    </spark-overlay>
-
-    <!-- Git Clone dialog -->
-    <spark-modal id="gitCloneDialog" class="spark-overlay-scale-slideup">
+    <!-- New File dialog -->
+    <spark-modal id="fileNewDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-header">
-        <spark-button overlay-toggle class="close" data-dismiss="modal"
-            aria-hidden="true">&times;</spark-button>
-        <h4 class="modal-title">Clone Git Project</h4>
+        <a href="#" class="close" overlay-toggle>&times;</a>
+        <h4 class="modal-title">New File</h4>
       </div>
       <div class="modal-body">
-        Repository URL: <input id="gitRepoUrl" type="text">
+        <div class="form-group">
+          <label for="fileName">New file name</label>
+          <input id="fileName" type="text" class="form-control" autofocus>
+        </div>
       </div>
       <div class="modal-footer">
         <spark-button overlay-toggle data-dismiss="modal">
           Cancel
         </spark-button>
-        <spark-button id="gitCloneButton" overlay-toggle primary
-          data-dismiss="modal">
+        <spark-button overlay-toggle primary data-dismiss="modal">
+          Create
+        </spark-button>
+      </div>
+    </spark-modal>
+
+    <!-- New Folder dialog -->
+    <spark-modal id="folderNewDialog" class="dialog spark-overlay-scale-slideup">
+      <div class="modal-header">
+        <a href="#" class="close" overlay-toggle>&times;</a>
+        <h4 class="modal-title">New Folder</h4>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="folderName">New folder name</label>
+          <input id="folderName" type="text" class="form-control" autofocus>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <spark-button overlay-toggle data-dismiss="modal">
+          Cancel
+        </spark-button>
+        <spark-button overlay-toggle primary data-dismiss="modal">
+          Create
+        </spark-button>
+      </div>
+    </spark-modal>
+
+    <!-- New Project dialog -->
+    <spark-modal id="newProjectDialog" class="dialog spark-overlay-scale-slideup">
+      <div class="modal-header">
+        <a href="#" class="close" overlay-toggle>&times;</a>
+        <h4 class="modal-title">New Project</h4>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="name">Project name</label>
+          <input id="name" type="text" class="form-control" autofocus>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <spark-button overlay-toggle data-dismiss="modal">
+          Cancel
+        </spark-button>
+        <spark-button overlay-toggle primary data-dismiss="modal">
+          Create
+        </spark-button>
+      </div>
+    </spark-modal>
+
+    <!-- Git Clone dialog -->
+    <spark-modal id="gitCloneDialog" class="dialog spark-overlay-scale-slideup">
+      <div class="modal-header">
+        <a href="#" class="close" overlay-toggle>&times;</a>
+        <h4 class="modal-title">Clone Git Project</h4>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="gitRepoUrl">Repository URL</label>
+          <input id="gitRepoUrl" type="text" class="form-control"
+              placeholder="https://github.com/foo/bar.git" autofocus>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <spark-button overlay-toggle data-dismiss="modal">
+          Cancel
+        </spark-button>
+        <spark-button overlay-toggle primary data-dismiss="modal">
           Clone
         </spark-button>
       </div>
     </spark-modal><!-- /.modal -->
 
     <!-- Git Commit dialog -->
-    <spark-modal id="gitCommitDialog" class="spark-overlay-scale-slideup">
+    <spark-modal id="gitCommitDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-header">
-        <spark-button overlay-toggle class="close" data-dismiss="modal"
-            aria-hidden="true">&times;</spark-button>
+        <a href="#" class="close" overlay-toggle>&times;</a>
         <h4 class="modal-title">Git Commit</h4>
       </div>
       <div class="modal-body">
-        Commit Message: <input id="commitMessage" type="text" focused><br/><br/>
+        <div class="form-group">
+          <label for="commitMessage">Commit message</label>
+          <textarea id="commitMessage" type="text" class="form-control"
+              rows="3" autofocus></textarea>
+          <span class="help-block">Enter a brief description of the changes.</span>
+        </div>
       </div>
       <div class="modal-footer">
         <spark-button overlay-toggle data-dismiss="modal">
           Cancel
         </spark-button>
-        <spark-button id="gitCommitButton" overlay-toggle primary
-          data-dismiss="modal">
+        <spark-button overlay-toggle primary data-dismiss="modal">
           Commit
         </spark-button>
       </div>
     </spark-modal><!-- /.modal -->
 
     <!-- Git Branch dialog -->
-    <spark-modal id="gitBranchDialog" class="spark-overlay-scale-slideup">
+    <spark-modal id="gitBranchDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-header">
-        <spark-button overlay-toggle class="close" data-dismiss="modal"
-            aria-hidden="true">&times;</spark-button>
+        <a href="#" class="close" overlay-toggle>&times;</a>
         <h4 class="modal-title">Create Branch</h4>
       </div>
       <div class="modal-body">
-        New Branch Name: <input id="gitBranchName" type="text" focused><br/><br/>
+        <div class="form-group">
+          <label for="gitBranchName">New branch name</label>
+          <input id="gitBranchName" type="text" class="form-control" autofocus>
+          <span class="help-block">Create a new git branch.</span>
+        </div>
       </div>
       <div class="modal-footer">
         <spark-button overlay-toggle data-dismiss="modal">
           Cancel
         </spark-button>
-        <spark-button id="gitBranchButton" overlay-toggle primary
-          data-dismiss="modal">
+        <spark-button overlay-toggle primary data-dismiss="modal">
           Create Branch
         </spark-button>
       </div>
     </spark-modal><!-- /.modal -->
 
     <!-- Git Checkout dialog -->
-    <spark-modal id="gitCheckoutDialog" class="spark-overlay-scale-slideup">
+    <spark-modal id="gitCheckoutDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-header">
-        <spark-button overlay-toggle class="close" data-dismiss="modal"
-            aria-hidden="true">&times;</spark-button>
+        <a href="#" class="close" overlay-toggle>&times;</a>
         <h4 class="modal-title">Git Checkout</h4>
       </div>
       <div class="modal-body">
-        Current Branch Name: <input id="currentBranchName" type="text" disabled>
-        <br/><br/>
-        <select id="gitCheckout"></select>
+        <div class="form-group">
+          <label for="currentBranchName">Current branch</label>
+          <input id="currentBranchName" type="text" class="form-control" disabled>
+        </div>
+        <div class="form-group">
+          <label for="gitCheckout">Switch to branch</label>
+          <select id="gitCheckout" class="form-control"></select>
+        </div>
       </div>
       <div class="modal-footer">
         <spark-button overlay-toggle data-dismiss="modal">
           Cancel
         </spark-button>
-        <spark-button id="gitCheckoutButton" overlay-toggle primary
-          data-dismiss="modal">
+        <spark-button overlay-toggle primary data-dismiss="modal">
           Checkout
         </spark-button>
       </div>
     </spark-modal><!-- /.modal -->
 
     <!-- About dialog -->
-    <spark-modal id="aboutDialog" class="spark-overlay-scale-slideup">
+    <spark-modal id="aboutDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-header">
-        <spark-button overlay-toggle class="close" data-dismiss="modal"
-            aria-hidden="true">&times;</spark-button>
+        <a href="#" class="close" overlay-toggle>&times;</a>
         <h4 class="modal-title">Spark</h4>
       </div>
       <div class="modal-body">
-        <dl>
-          <dt>A Chrome Apps based development environment</dt>
-          <dd>version <span id="aboutVersion"></span></dd>
-        </dl>
-        <div class="checkbox">
-          <label>
-            <input id="analyticsCheck" type="checkbox">
-              Allow Spark to collect anonymous usage statistics
-          </label>
+        <div class="form-group">
+          <span class="help-block">
+            A Chrome Apps based development environment (v<span id="aboutVersion"></span>)
+          </span>
+        </div>
+        <div class="form-group">
+          <div class="checkbox">
+            <label>
+              <input id="analyticsCheck" type="checkbox">
+                Allow Spark to collect anonymous usage statistics
+            </label>
+          </div>
         </div>
       </div>
       <div class="modal-footer">
@@ -260,29 +323,47 @@
     </spark-modal><!-- /.modal -->
 
     <!-- Setting dialog -->
-    <spark-modal id="settingsDialog" class="spark-overlay-scale-slideup">
+    <spark-modal id="settingsDialog" class="dialog spark-overlay-scale-slideup">
       <div class="modal-header">
-        <spark-button overlay-toggle class="close" data-dismiss="modal"
-            aria-hidden="true">&times;</spark-button>
+        <a href="#" class="close" overlay-toggle>&times;</a>
         <h4 class="modal-title">Settings</h4>
       </div>
       <div class="modal-body">
-        <div id="changeTheme">
-          <span class="settings-title">Editor theme:</span>
-          <span class="settings-label"></span>
-          <span class="plus-minus-container">
-            <a href="#" id="themeMinus" class="plus-minus-button" on-click="{{onThemeMinus}}">-</a>
-            <a href="#" id="themePlus" class="plus-minus-button" on-click="{{onThemePlus}}">+</a>
-          </span>
+        <div class="form-group">
+          <div id="changeTheme">
+            <label class="settings-title">Editor theme</label>
+            <div>
+              <span class="settings-label"></span>
+              <span class="plus-minus-container">
+                <a href="#" id="themeMinus" class="plus-minus-button"
+                    on-click="{{onThemeMinus}}">
+                  <span class="glyphicon glyphicon-chevron-left"></span>
+                </a>
+                <a href="#" id="themePlus" class="plus-minus-button"
+                    on-click="{{onThemePlus}}">
+                  <span class="glyphicon glyphicon-chevron-right"></span>
+                </a>
+              </span>
+            </div>
+          </div>
         </div>
-        <br/>
-        <div id="changeKeys">
-          <span class="settings-title">Key bindings:</span>          
-          <span class="settings-label"></span>
-          <span class="plus-minus-container">
-            <a href="#" id="keysMinus" class="plus-minus-button" on-click="{{onKeysMinus}}">-</a>
-            <a href="#" id="keysPlus" class="plus-minus-button" on-click="{{onKeysPlus}}">+</a>
-          </span>
+        <div class="form-group">
+          <div id="changeKeys">
+            <label class="settings-title">Key bindings</label>
+            <div>
+              <span class="settings-label"></span>
+              <span class="plus-minus-container">
+                <a href="#" id="keysMinus" class="plus-minus-button"
+                    on-click="{{onKeysMinus}}">
+                  <span class="glyphicon glyphicon-chevron-left"></span>
+                </a>
+                <a href="#" id="keysPlus" class="plus-minus-button"
+                    on-click="{{onKeysPlus}}">
+                  <span class="glyphicon glyphicon-chevron-right"></span>
+                </a>
+              </span>
+            </div>
+          </div>
         </div>
       </div>
       <div class="modal-footer">

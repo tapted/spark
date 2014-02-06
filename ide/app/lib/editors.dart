@@ -16,6 +16,7 @@ import 'ace.dart' as ace;
 import 'event_bus.dart';
 import 'preferences.dart';
 import 'workspace.dart';
+import 'ui/widgets/imageviewer.dart';
 
 // The auto-save delay - the time from the last user edit to the file auto-save.
 final int _DELAY_MS = 500;
@@ -48,6 +49,7 @@ abstract class Editor {
   void activate();
   void resize();
   void focus();
+  void fileContentsChanged();
   Future save();
 }
 
@@ -60,7 +62,13 @@ class EditorManager implements EditorProvider {
   final PreferenceStore _prefs;
   final EventBus _eventBus;
 
-  final int PREFS_EDITORSTATES_VERSION = 1;
+  StreamController _newFileOpenedController = new StreamController.broadcast();
+  Stream get onNewFileOpened => _newFileOpenedController.stream;
+
+  static final int PREFS_EDITORSTATES_VERSION = 1;
+
+  static final int EDITOR_TYPE_IMAGE = 1;
+  static final int EDITOR_TYPE_TEXT = 2;
 
   // List of files opened in a tab.
   final List<_EditorState> _openedEditorStates = [];
@@ -75,12 +83,24 @@ class EditorManager implements EditorProvider {
   final StreamController<File> _selectedController =
       new StreamController.broadcast();
 
+  static final RegExp _imageFileType =
+      new RegExp(r'\.(jpe?g|png|gif)$', caseSensitive: false);
+
   // TODO: Investigate dependency injection OR overridable singletons. We're
   // passing around too many ctor vars.
   EditorManager(this._workspace, this._aceContainer, this._prefs, this._eventBus) {
     _workspace.whenAvailable().then((_) {
       _restoreState().then((_) {
         _loadedCompleter.complete(true);
+      });
+      _workspace.onResourceChange.listen((ResourceChangeEvent event) {
+        for (ChangeDelta delta in event.changes) {
+          if (delta.isDelete && delta.resource.isFile) {
+            _handleFileDeleted(delta.resource);
+          } else if (delta.isChange && delta.resource.isFile) {
+            _handleFileChanged(delta.resource);
+          }
+        }
       });
     });
   }
@@ -95,7 +115,7 @@ class EditorManager implements EditorProvider {
 
   void _insertState(_EditorState state) {
     _openedEditorStates.add(state);
-    _savedEditorStates[state.file.persistToToken()] = state;
+    _savedEditorStates[state.file.uuid] = state;
   }
 
   bool _removeState(_EditorState state) => _openedEditorStates.remove(state);
@@ -109,7 +129,7 @@ class EditorManager implements EditorProvider {
     _EditorState state = _getStateFor(file);
 
     if (state == null) {
-      state = _savedEditorStates[file.persistToToken()];
+      state = _savedEditorStates[file.uuid];
       if (state == null) {
         state = new _EditorState.fromFile(this, file);
       }
@@ -149,6 +169,8 @@ class EditorManager implements EditorProvider {
         }
       }
 
+      _editorMap.remove(file);
+
       persistState();
     }
   }
@@ -163,7 +185,7 @@ class EditorManager implements EditorProvider {
     //     ensure that the format is valid.
     Map savedMap = {};
     savedMap['openedTabs'] =
-        _openedEditorStates.map((_EditorState s) => s.file.persistToToken()).
+        _openedEditorStates.map((_EditorState s) => s.file.uuid).
         toList();
     List<Map> filesState = [];
     _savedEditorStates.forEach((String key, _EditorState value) {
@@ -224,17 +246,31 @@ class EditorManager implements EditorProvider {
         _aceContainer.switchTo(null);
         persistState();
       } else {
+        // Clear text content of ACE editor.
+        _aceContainer.switchTo(null);
+
+        if (!state.hasSession) {
+          _newFileOpenedController.add(null);
+        }
+
+        // Then load content.
         state.withSession().then((state) {
           // Test if other state have been set before this state is appiled.
           if (state != _currentState) {
             return;
           }
-          // TODO: this explicit casting to AceEditor will go away in a future refactoring
-          (_editorMap[currentFile] as ace.TextEditor).setSession(state.session);
-          _selectedController.add(currentFile);
-          _aceContainer.switchTo(state.session, state.file);
-          _aceContainer.cursorPosition = state.cursorPosition;
-          persistState();
+          if (editorType(state.file.name) == EDITOR_TYPE_IMAGE) {
+            _selectedController.add(currentFile);
+            persistState();
+          } else if (_editorMap[currentFile] != null) {
+            // TODO: this explicit casting to AceEditor will go away in a future refactoring
+            ace.TextEditor textEditor = _editorMap[currentFile];
+            textEditor.setSession(state.session);
+            _selectedController.add(currentFile);
+            _aceContainer.switchTo(state.session, state.file);
+            _aceContainer.cursorPosition = state.cursorPosition;
+            persistState();
+          }
         });
       }
     }
@@ -270,10 +306,51 @@ class EditorManager implements EditorProvider {
     }
   }
 
+  int editorType(String filename) {
+    if (_imageFileType.hasMatch(filename)) {
+      return EDITOR_TYPE_IMAGE;
+    } else {
+      return EDITOR_TYPE_TEXT;
+    }
+  }
+
+  void _handleFileDeleted(File file) {
+    // If the file is open in an editor, the editor will take care of closing.
+    if (_editorMap.containsKey(file)) {
+      return;
+    }
+
+    String key = file.uuid;
+
+    if (_savedEditorStates.containsKey(key)) {
+      _savedEditorStates.remove(key);
+    }
+  }
+
+  void _handleFileChanged(File file) {
+    // If the file is open in an editor, the editor will take care of updating.
+    if (_editorMap.containsKey(file)) {
+      return;
+    }
+
+    String key = file.uuid;
+
+    if (_savedEditorStates.containsKey(key)) {
+      // Update the saved state.
+      _savedEditorStates[key].handleFileChanged();
+    }
+  }
+
   // EditorProvider
   Editor createEditorForFile(File file) {
-    ace.TextEditor editor =
-        _editorMap[file] != null ? _editorMap[file] : new ace.TextEditor(_aceContainer, file);
+    Editor editor = _editorMap[file];
+    assert(editor == null);
+    if (editorType(file.name) == EDITOR_TYPE_IMAGE) {
+      editor = new ImageViewer(file);
+    } else {
+      editor = new ace.TextEditor(_aceContainer, file);
+    }
+
     _editorMap[file] = editor;
     openFile(file);
     editor.onDirtyChange.listen((_) {
@@ -285,6 +362,7 @@ class EditorManager implements EditorProvider {
   void activate(Editor editor) {
     _EditorState state = _getStateFor(editor.file);
     _switchState(state);
+    _aceContainer.createDialog(editor.file.name);
     _aceContainer.setMarkers(editor.file.getMarkers());
   }
 }
@@ -335,7 +413,7 @@ class _EditorState {
    */
   Map toMap() {
     Map m = {};
-    m['file'] = file.persistToToken();
+    m['file'] = file.uuid;
     m['scrollTop'] = scrollTop;
     m['column'] = cursorPosition.x;
     m['row'] = cursorPosition.y;
@@ -346,10 +424,23 @@ class _EditorState {
     if (hasSession) {
       return new Future.value(this);
     } else {
-      return file.getContents().then((text) {
-        session = manager._aceContainer.createEditSession(text, file.name);
-        session.scrollTop = scrollTop;
-        return this;
+      if (manager.editorType(file.name) == EditorManager.EDITOR_TYPE_IMAGE) {
+        return new Future.value(this);
+      } else {
+        // TODO(dvh): don't load if the user cannot see the content.
+        return file.getContents().then((text) {
+          session = manager._aceContainer.createEditSession(text, file.name);
+          session.scrollTop = scrollTop;
+          return this;
+        });
+      }
+    }
+  }
+
+  void handleFileChanged() {
+    if (session != null) {
+      file.getContents().then((String text) {
+        session.value = text;
       });
     }
   }

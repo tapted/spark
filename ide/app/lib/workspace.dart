@@ -15,27 +15,35 @@ import 'dart:math' as math;
 import 'package:chrome/chrome_app.dart' as chrome;
 import 'package:logging/logging.dart';
 
+import 'builder.dart';
+import 'jobs.dart';
 import 'preferences.dart';
 
 final Logger _logger = new Logger('spark.workspace');
+
+final _ChromeHelper _chromeHelper = new _ChromeHelper();
 
 /**
  * The Workspace is a top-level entity that can contain files and projects. The
  * files that it contains are loose files; they do not have parent projects.
  */
 class Workspace implements Container {
+  int _resourcePauseCount = 0;
+  List<ChangeDelta> _resourceChangeList = [];
 
   int _markersPauseCount = 0;
   List<MarkerDelta> _makerChangeList = [];
 
   Container _parent = null;
 
+  BuilderManager _builderManager;
+
   chrome.Entry get _entry => null;
   set _entry(chrome.Entry value) => null;
   chrome.Entry get entry => null;
 
-  List<Resource> _localChildren = [];
-  List<Resource> _syncChildren = [];
+  List<WorkspaceRoot> _roots = [];
+
   chrome.FileSystem _syncFileSystem;
 
   PreferenceStore _store;
@@ -53,11 +61,17 @@ class Workspace implements Container {
   Future<Workspace> whenAvailable() => _whenAvailable.future;
   Future<Workspace> whenAvailableSyncFs() => _whenAvailableSyncFs.future;
 
+  BuilderManager get builderManager => _builderManager;
+
+  void createBuilderManager(JobManager jobManager) {
+    _builderManager = new BuilderManager(this, jobManager);
+  }
+
   String get name => null;
   String get path => '';
   bool get isTopLevel => false;
   bool get isFile => false;
-  String persistToToken() => path;
+  String get uuid => '';
 
   Future delete() => new Future.value();
   Future rename(String name) => new Future.value();
@@ -65,6 +79,26 @@ class Workspace implements Container {
   Container get parent => null;
   Project get project => null;
   Workspace get workspace => this;
+
+  /**
+   * Stops the posting of [ResourceChangeEvent] to the stream. Clients should
+   * call [resumeResourceEvents] to resume posting of maker events.
+   */
+  void pauseResourceEvents() {
+    _resourcePauseCount++;
+  }
+
+  /**
+   * Resumes posting of resource events to the stream. All resource changes made
+   * when the stream was paused will be posted on resume.
+   */
+  void resumeResourceEvents() {
+    _resourcePauseCount--;
+    if (_resourcePauseCount == 0 && _resourceChangeList.isNotEmpty) {
+      _resourceController.add(new ResourceChangeEvent.fromList(_resourceChangeList));
+      _resourceChangeList.clear();
+    }
+  }
 
   /**
    * Stops the posting of [MarkerChangeEvent] to the stream. Clients should
@@ -87,47 +121,30 @@ class Workspace implements Container {
   }
 
   /**
-   * Adds a chrome entry and its children to the workspace.
-   * [syncable] indicates whether the entry is in the sync file sytem.
+   * Adds a new [WorkspaceRoot] to the workspace.
    */
-  Future<Resource> link(chrome.Entry entity, {bool syncable: false}) {
-    return _link(entity, syncable: syncable, fireEvent: true);
-  }
+  Future<Resource> link(WorkspaceRoot root, {bool fireEvent: true}) {
+    root.resource = root.createResource(this);
+    _roots.add(root);
 
-  Future<Resource> _link(chrome.Entry entity, {bool syncable: false, bool fireEvent: true}) {
-    if (entity.isFile) {
-      var resource = new File(this, entity);
-      if (syncable) {
-        _syncChildren.add(resource);
-      } else {
-        _localChildren.add(resource);
-      }
-      if (fireEvent) {
-        _resourceController.add(
-            new ResourceChangeEvent.fromSingle(new ChangeDelta(resource, EventType.ADD)));
-      }
-      return new Future.value(resource);
-    } else {
-      var project = new Project(this, entity);
-      if (syncable) {
-        _syncChildren.add(project);
-      } else {
-        _localChildren.add(project);
-      }
-      return _gatherChildren(project).then((container) {
+    if (root.resource is Container) {
+      return _gatherChildren(root.resource).then((Container container) {
         if (fireEvent) {
-          _resourceController.add(
-              new ResourceChangeEvent.fromSingle(new ChangeDelta(container, EventType.ADD)));
+          _resourceController.add(new ResourceChangeEvent.fromSingle(
+              new ChangeDelta(container, EventType.ADD)));
         }
         return container;
       });
+    } else {
+      if (fireEvent) {
+        _resourceController.add(new ResourceChangeEvent.fromSingle(
+            new ChangeDelta(root.resource, EventType.ADD)));
+      }
+      return new Future.value(root.resource);
     }
   }
 
   void unlink(Resource resource) {
-    if (!_localChildren.contains(resource) && !_syncChildren.contains(resource)) {
-      throw new ArgumentError('${resource} is not a top level entity');
-    }
     _removeChild(resource);
   }
 
@@ -156,17 +173,19 @@ class Workspace implements Container {
 
       if (newEntry.isFile) {
         var file = new File(container, newEntry);
-        container._localChildren.add(file);
+        container.getChildren().add(file);
         return new Future.value(new ChangeDelta(file, EventType.ADD));
       } else {
         var folder = new Folder(container, newEntry);
-        container._localChildren.add(folder);
+        container.getChildren().add(folder);
         return _gatherChildren(folder).then((_) => new ChangeDelta(folder, EventType.ADD));
       }
     });
   }
 
-  bool isSyncResource(Resource resource) => _syncChildren.contains(resource);
+  bool isSyncResource(Resource resource) {
+    return _roots.any((root) => root is SyncFolderRoot && root.resource == resource);
+  }
 
   Resource getChild(String name) {
     return getChildren().firstWhere((c) => c.name == name, orElse: () => null);
@@ -187,31 +206,39 @@ class Workspace implements Container {
   }
 
   List<Resource> getChildren() {
-    var list = new List.from(_localChildren);
-    list.addAll(_syncChildren);
-    return list;
+    return _roots.map((root) => root.resource).toList(growable: false);
   }
 
   Iterable<Resource> traverse() => Resource._workspaceTraversal(this);
 
-
   List<File> getFiles() {
-    var list = _localChildren.where((c) => c is File).toList();
-    list.addAll(_syncChildren.where((c) => c is File));
-    return list;
+    return _roots
+        .map((root) => root.resource)
+        .where((resource) => resource is File).toList();
   }
 
   List<Project> getProjects() {
-    var projects = _localChildren.where((c) => c is Project).toList();
-    projects.addAll(_syncChildren.where((c) => c is Project));
-    return projects;
+    return _roots
+        .map((root) => root.resource)
+        .where((resource) => resource is Project).toList();
   }
 
   Stream<ResourceChangeEvent> get onResourceChange => _resourceController.stream;
 
   Stream<MarkerChangeEvent> get onMarkerChange => _markerController.stream;
 
-  void _fireResourceEvent(ResourceChangeEvent event) => _resourceController.add(event);
+  // TODO(ericarnold): We can remove this method once we analyze whole projects.
+  void checkResource(Resource resource) {
+    _fireResourceEvent(new ChangeDelta(resource, EventType.CHANGE));
+  }
+
+  void _fireResourceEvent(ChangeDelta delta) {
+    if (_resourcePauseCount == 0) {
+      _resourceController.add(new ResourceChangeEvent.fromSingle(delta));
+    } else {
+      _resourceChangeList.add(delta);
+    }
+  }
 
   void _fireMarkerEvent(MarkerDelta delta) {
     if (_markersPauseCount == 0) {
@@ -225,15 +252,30 @@ class Workspace implements Container {
    * Read the workspace data from storage and restore entries.
    */
   Future restore() {
-    _store.getValue('workspace').then((s) {
-      if (s == null) return null;
+    _store.getValue('workspaceRoots').then((s) {
+      if (s == null) {
+        _whenAvailable.complete(this);
+        return null;
+      }
 
       try {
-        List<String> ids = JSON.decode(s);
-        Future.forEach(ids, (id) {
-          return chrome.fileSystem.restoreEntry(id)
-              .then((entry) => _link(entry, fireEvent: false))
-              .catchError((_) => null);
+        pauseResourceEvents();
+
+        List<Map> data = JSON.decode(s);
+
+        List<WorkspaceRoot> roots = [];
+
+        for (Map m in data) {
+          WorkspaceRoot root = WorkspaceRoot.restoreRoot(m);
+          if (root != null) roots.add(root);
+        }
+
+        Future.forEach(roots, (WorkspaceRoot root) {
+          return root.restore().then((_) {
+            return link(root, fireEvent: false);
+          });
+        }).whenComplete(() {
+          resumeResourceEvents();
         }).then((_) => _whenAvailable.complete(this));
       } catch (e) {
         _logger.log(Level.INFO, 'Exception in workspace restore', e);
@@ -245,16 +287,33 @@ class Workspace implements Container {
   }
 
   /**
-   * read the sync file system and restore entries.
+   * Store info for workspace children.
+   */
+  Future save() {
+    List<Map> data = [];
+
+    for (WorkspaceRoot root in _roots) {
+      Map m = root.persistState();
+      if (m != null) data.add(m);
+    }
+
+    return _store.setValue('workspaceRoots', JSON.encode(data));
+  }
+
+  bool get syncFsIsAvailable => _syncFileSystem != null;
+
+  /**
+   * Read the sync file system and restore entries.
    */
   Future restoreSyncFs() {
     chrome.syncFileSystem.requestFileSystem().then((/*chrome.FileSystem*/ fs) {
       _syncFileSystem = fs;
       _syncFileSystem.root.createReader().readEntries().then((List<chrome.Entry> entries) {
+        pauseResourceEvents();
         Future.forEach(entries, (chrome.Entry entry) {
-          // TODO: send one event when complete, rather than firing individual
-          // resource change events.
-          _link(entry, syncable: true);
+          return link(new SyncFolderRoot(entry));
+        }).whenComplete(() {
+          resumeResourceEvents();
         }).then((_) => _whenAvailableSyncFs.complete(this));
       });
     }, onError: (e) {
@@ -266,28 +325,33 @@ class Workspace implements Container {
   }
 
   /**
-   * Store info for workspace children.
+   * Restore a [Resource] given a uuid for that Resource.
    */
-  Future save() {
-    List<String> entries = _localChildren.map(
-        (c) => chrome.fileSystem.retainEntry(c.entry)).toList();
+  Resource restoreResource(String uuid) {
+    if (uuid == '') return this;
 
-    return _store.setValue('workspace', JSON.encode(entries));
-  }
+    String first = uuid;
+    String rest = null;
 
-  bool get syncFsIsAvailable => _syncFileSystem != null;
+    int index = uuid.indexOf('/');
+    if (index != -1) {
+      first = uuid.substring(0, index);
+      rest = uuid.substring(index + 1);
+    }
 
-  Future<File> createFileSyncFs(name) {
-    _syncFileSystem.root.createFile(name).then((chrome.Entry entry) {
-      link(entry, syncable: true).then((resource) => resource);
-    }, onError: (_) => null);
-  }
+    WorkspaceRoot root = _roots.firstWhere(
+        (r) => r.id == first, orElse: () => null);
 
-  Resource restoreResource(String token) {
-    if (token == '') return this;
-    if (!token.startsWith('/')) return null;
+    if (root == null) return null;
+    if (rest == null) return root.resource;
 
-    return getChildPath(token.substring(1));
+    Resource resource = root.resource;
+
+    if (resource is Container) {
+      return resource.getChildPath(rest);
+    } else {
+      return null;
+    }
   }
 
   List<Marker> getMarkers() => [];
@@ -304,10 +368,10 @@ class Workspace implements Container {
       for (chrome.Entry ent in entries) {
         if (ent.isFile) {
           var file = new File(container, ent);
-          container._localChildren.add(file);
+          container.getChildren().add(file);
         } else {
           var folder = new Folder(container, ent);
-          container._localChildren.add(folder);
+          container.getChildren().add(folder);
           futures.add(_gatherChildren(folder));
         }
       }
@@ -316,113 +380,27 @@ class Workspace implements Container {
   }
 
   /**
-   * Updates the content of the workspace with what's on the filesystem.
-   */
-  Future _reloadContents() {
-    List futures = [];
-    for (Project resource in getChildren()) {
-      if (resource is Project) {
-        // We use a temporary project to fill the children...
-        Project tmpProject =
-            new Project(this, resource.entry);
-        Future future =
-            _gatherChildren(tmpProject).then((container) {
-          // Then, we are able to replace the children in one atomic operation.
-          // It helps make the UI more stable visually.
-          // TODO(dvh): indentity of objects needs to be preserved.
-          resource._localChildren = tmpProject._localChildren;
-          tmpProject._localChildren = [];
-          _resourceController.add(new ResourceChangeEvent.fromSingle(
-                new ChangeDelta(resource, EventType.CHANGE)));
-          return container;
-        });
-        futures.add(future);
-      }
-    }
-    return Future.wait(futures);
-  }
-
-  /**
    * This method checks if the layout of files on the filesystem has changed
    * and will update the content of the workspace if needed.
    */
   Future refresh() {
-    Set<String> existing = new Set();
-    _fillSetWithResource(existing, this);
-    Set<String> current = new Set();
-    List futures = [];
-    for (Resource resource in getChildren()) {
-      futures.add(_gatherPaths(current, resource.entry));
-    }
-    return Future.wait(futures).then((e) {
-      Set<String> union = new Set();
-      union.addAll(current);
-      union.addAll(existing);
-      // We compare the list of paths.
-      if (union.length != current.length ||
-          current.length != existing.length) {
-        return _reloadContents();
-      } else {
-        return new Future.value();
-      }
+    List<Project> projects = getProjects().toList();
+
+    return Future.forEach(projects, (Project project) {
+      return _runInTimer(() => project.refresh());
     });
   }
 
-  /**
-   * Collect the list of paths (and subpaths for the given entry) as strings
-   * in a Set.
-   */
-  Future _gatherPaths(Set<String> paths, chrome.Entry entry) {
-    paths.add(entry.fullPath);
-    if (entry is chrome.DirectoryEntry) {
-      return entry.createReader().readEntries().then((entries) {
-        List futures = [];
-        for (chrome.Entry ent in entries) {
-          if (ent.name == '.git') {
-            continue;
-          }
-          futures.add(_gatherPaths(paths, ent));
-        }
-        return Future.wait(futures);
-      });
-    } else {
-      return new Future.value();
-    }
-  }
-
-  /**
-   * Collect the list of paths (and subpaths for the given resource) as strings
-   * in a Set.
-   */
-  void _fillSetWithResource(Set<String> paths, Resource resource) {
-    if (resource is! Workspace) {
-      paths.add(resource.path);
-    }
-    if (resource is Container) {
-      resource.getChildren().forEach((Resource child) {
-        _fillSetWithResource(paths, child);
-      });
-    }
-  }
-
   void _removeChild(Resource resource, {bool fireEvent: true}) {
-    if (_localChildren.contains(resource)) {
-      _localChildren.remove(resource);
-    } else {
-      _syncChildren.remove(resource);
+    _roots.removeWhere((root) => root.resource == resource);
+    if (fireEvent) {
+      _fireResourceEvent(new ChangeDelta(resource, EventType.DELETE));
     }
-   if (fireEvent) {
-     _fireResourceEvent(new ResourceChangeEvent.fromSingle(
-         new ChangeDelta(resource, EventType.DELETE)));
-   }
   }
 }
 
 abstract class Container extends Resource {
-  List<Resource> _localChildren = [];
-
-  Container(Container parent, chrome.Entry entry):
-    super(parent, entry);
+  Container(Container parent, chrome.Entry entry) : super(parent, entry);
 
   Resource getChild(String name) {
     for (Resource resource in getChildren()) {
@@ -449,17 +427,17 @@ abstract class Container extends Resource {
   }
 
   void _removeChild(Resource resource, {bool fireEvent: true}) {
-    _localChildren.remove(resource);
+    getChildren().remove(resource);
     if (fireEvent) {
-      _fireResourceEvent(new ResourceChangeEvent.fromSingle(
-          new ChangeDelta(resource, EventType.DELETE)));
+      _fireResourceEvent(new ChangeDelta(resource, EventType.DELETE));
     }
   }
 
-  List<Resource> getChildren() => _localChildren;
+  List<Resource> getChildren();
 
   List<Marker> getMarkers() {
-    return traverse().where((r) => r is File).expand((f) => f.getMarkers());
+    return traverse().where((r) => r is File)
+        .expand((f) => f.getMarkers()).toList();
   }
 
   void clearMarkers() {
@@ -499,23 +477,23 @@ abstract class Resource {
 
   /**
    * Return the path to this element from the workspace. Paths are not
-   * guaranteed to be unique.
+   * guaranteed to be unique. For uniqueness, see [uuid].
    */
   String get path => '${parent.path}/${name}';
+
+  /**
+   * Return a unique identifier for this [Resource]. This is a token that can be
+   * later used to deserialize this [Resource].
+   */
+  String get uuid => '${parent.uuid}/${name}';
 
   bool get isTopLevel => _parent is Workspace;
 
   bool get isFile => false;
 
-  /**
-   * Return a token that can be later used to deserialize this [Resource]. This
-   * is an opaque token.
-   */
-  String persistToToken() => path;
-
   Container get parent => _parent;
 
-  void _fireResourceEvent(ResourceChangeEvent event) => _parent._fireResourceEvent(event);
+  void _fireResourceEvent(ChangeDelta delta) => _parent._fireResourceEvent(delta);
 
   void _fireMarkerEvent(MarkerDelta delta) => _parent._fireMarkerEvent(delta);
 
@@ -523,11 +501,10 @@ abstract class Resource {
 
   Future rename(String name) {
     return entry.moveTo(_parent._entry, name: name).then((chrome.Entry e) {
-      List<ChangeDelta> list = [];
-      list.add(new ChangeDelta(this, EventType.DELETE));
-      _entry = e;
-      list.add(new ChangeDelta(this, EventType.ADD));
-      _fireResourceEvent(new ResourceChangeEvent.fromList(list));
+      workspace.pauseResourceEvents();
+      _fireResourceEvent(new ChangeDelta(this, EventType.DELETE));
+      _fireResourceEvent(new ChangeDelta(this, EventType.ADD));
+      workspace.resumeResourceEvents();
     });
   }
 
@@ -540,9 +517,9 @@ abstract class Resource {
   Workspace get workspace => parent.workspace;
 
   bool operator ==(other) =>
-      this.runtimeType == other.runtimeType && path == other.path;
+      this.runtimeType == other.runtimeType && uuid == other.uuid;
 
-  int get hashCode => path.hashCode;
+  int get hashCode => uuid.hashCode;
 
   String toString() => '${this.runtimeType} ${name}';
 
@@ -572,8 +549,11 @@ abstract class Resource {
 }
 
 class Folder extends Container {
-  Folder(Container parent, chrome.Entry entry):
-    super(parent, entry);
+  List<Resource> _children = [];
+
+  Folder(Container parent, chrome.Entry entry) : super(parent, entry);
+
+  List<Resource> getChildren() => _children;
 
   /**
    * Creates a new [File] with the given name
@@ -581,9 +561,8 @@ class Folder extends Container {
   Future<File> createNewFile(String name) {
     return _dirEntry.createFile(name).then((entry) {
       File file = new File(this, entry);
-      _localChildren.add(file);
-      _fireResourceEvent(new ResourceChangeEvent.fromSingle(
-          new ChangeDelta(file, EventType.ADD)));
+      _children.add(file);
+      _fireResourceEvent(new ChangeDelta(file, EventType.ADD));
       return file;
     });
   }
@@ -591,9 +570,8 @@ class Folder extends Container {
   Future<Folder> createNewFolder(String name) {
     return _dirEntry.createDirectory(name).then((entry) {
       Folder folder = new Folder(this, entry);
-      _localChildren.add(folder);
-      _fireResourceEvent(new ResourceChangeEvent.fromSingle(
-          new ChangeDelta(folder, EventType.ADD)));
+      _children.add(folder);
+      _fireResourceEvent(new ChangeDelta(folder, EventType.ADD));
       return folder;
     });
   }
@@ -602,14 +580,70 @@ class Folder extends Container {
     return _dirEntry.removeRecursively().then((_) => _parent._removeChild(this));
   }
 
+  Future _refresh() {
+    return _dirEntry.createReader().readEntries().then((List<chrome.Entry> entries) {
+      List<String> currentNames = _children.map((r) => r.name).toList();
+      List<String> newNames = entries.map((e) => e.name).toList();
+      List<Resource> checkChanged = [];
+
+      // Check for deleted files.
+      for (int i = currentNames.length - 1; i >= 0; i--) {
+        String name = currentNames[i];
+
+        if (newNames.contains(name)) {
+          checkChanged.add(_children[i]);
+        } else {
+          Resource resource = _children.removeAt(i);
+          _fireResourceEvent(new ChangeDelta(resource, EventType.DELETE));
+        }
+      }
+
+      List<Future> futures = [];
+
+      // Check for added files.
+      for (int i = newNames.length - 1; i >= 0; i--) {
+        String name = newNames[i];
+
+        if (!currentNames.contains(name)) {
+          Resource resource;
+
+          if (entries[i].isFile) {
+            resource = new File(this, entries[i]);
+          } else {
+            resource = new Folder(this, entries[i]);
+            futures.add(workspace._gatherChildren(resource));
+          }
+
+          _children.add(resource);
+          _fireResourceEvent(new ChangeDelta(resource, EventType.ADD));
+        }
+      }
+
+      // Check for modified files.
+      return Future.forEach(checkChanged, (Resource resource) {
+        if (resource is File) {
+          return resource._refresh();
+        } else if (resource is Folder) {
+          return resource._refresh();
+        }
+      }).then((_) {
+        return Future.wait(futures);
+      });
+    });
+  }
+
   chrome.DirectoryEntry get _dirEntry => entry;
 }
 
 class File extends Resource {
   List<Marker> _markers = [];
+  int _timestamp;
 
-  File(Container parent, chrome.Entry entry):
-    super(parent, entry);
+  File(Container parent, chrome.Entry entry) : super(parent, entry) {
+    entry.getMetadata().then((/*Metadata*/ metaData) {
+      _timestamp = metaData.modificationTime.millisecondsSinceEpoch;
+    });
+  }
 
   Future<String> getContents() => _fileEntry.readText();
 
@@ -617,8 +651,7 @@ class File extends Resource {
 
   Future setContents(String contents) {
     return _fileEntry.writeText(contents).then((_) {
-      workspace._fireResourceEvent(new ResourceChangeEvent.fromSingle(
-          new ChangeDelta(this, EventType.CHANGE)));
+      workspace._fireResourceEvent(new ChangeDelta(this, EventType.CHANGE));
     });
   }
 
@@ -629,8 +662,7 @@ class File extends Resource {
   Future setBytes(List<int> data) {
     chrome.ArrayBuffer bytes = new chrome.ArrayBuffer.fromBytes(data);
     return _fileEntry.writeBytes(bytes).then((_) {
-      workspace._fireResourceEvent(new ResourceChangeEvent.fromSingle(
-          new ChangeDelta(this, EventType.CHANGE)));
+      workspace._fireResourceEvent(new ChangeDelta(this, EventType.CHANGE));
     });
   }
 
@@ -668,6 +700,16 @@ class File extends Resource {
     return severity;
   }
 
+  Future _refresh() {
+    return entry.getMetadata().then((/*Metadata*/ metaData) {
+      final int newStamp = metaData.modificationTime.millisecondsSinceEpoch;
+      if (newStamp != _timestamp) {
+        _timestamp = newStamp;
+        _fireResourceEvent(new ChangeDelta(this, EventType.CHANGE));
+      }
+    });
+  }
+
   chrome.ChromeFileEntry get _fileEntry => entry;
 }
 
@@ -676,10 +718,195 @@ class File extends Resource {
  * [Projects]s can be immediate child elements of a [Workspace].
  */
 class Project extends Folder {
-  Project(Container parent, chrome.Entry entry):
-    super(parent, entry);
+  WorkspaceRoot _root;
+
+  Project(Workspace workspace, WorkspaceRoot root) : super(workspace, root.entry) {
+    _root = root;
+  }
 
   Project get project => this;
+
+  String get uuid => '${_root.id}';
+
+  /**
+   * Check the files on disk for changes that we don't know about. Fire resource
+   * change events as necessary.
+   */
+  Future refresh() {
+    workspace.pauseResourceEvents();
+
+    return _refresh().whenComplete(() {
+      workspace.resumeResourceEvents();
+    });
+  }
+}
+
+/**
+ * This class represents a top-level file.
+ */
+class LooseFile extends File {
+  WorkspaceRoot _root;
+
+  LooseFile(Workspace workspace, WorkspaceRoot root) : super(workspace, root.entry) {
+    _root = root;
+  }
+
+  String get uuid => '${_root.id}';
+}
+
+/**
+ * A [WorkspaceRoot] is something that can be linked into the top-level of the
+ * workspace.
+ */
+abstract class WorkspaceRoot {
+
+  static WorkspaceRoot restoreRoot(Map m) {
+    if (m['type'] == 'file') {
+      return new FileRoot._(m);
+    } else if (m['type'] == 'folder') {
+      return new FolderRoot._(m);
+    } else if (m['type'] == 'folderChild') {
+      return new FolderChildRoot._(m);
+    } else {
+      return null;
+    }
+  }
+
+  chrome.Entry entry;
+  Resource resource;
+  String get id;
+
+  Resource createResource(Workspace workspace);
+  Future restore();
+  Map persistState();
+}
+
+/**
+ * A workspace root that represents a single loose file.
+ */
+class FileRoot extends WorkspaceRoot {
+  String token;
+
+  FileRoot(chrome.FileEntry fileEntry) {
+    entry = fileEntry;
+    token = _chromeHelper.retainEntry(fileEntry);
+  }
+
+  FileRoot._(Map m) {
+    token = m['token'];
+  }
+
+  String get id => token;
+
+  Resource createResource(Workspace workspace) => new LooseFile(workspace, this);
+
+  Future restore() {
+    return _chromeHelper.restoreEntry(token).then((e) {
+      entry = e;
+    });
+  }
+
+  Map persistState() {
+    return {
+      'type': 'file',
+      'token': token
+    };
+  }
+}
+
+/**
+ * A workspace root that represents a folder specifically selected by the user.
+ */
+class FolderRoot extends WorkspaceRoot {
+  String token;
+
+  FolderRoot(chrome.DirectoryEntry folderEntry) {
+    entry = folderEntry;
+    token = _chromeHelper.retainEntry(folderEntry);
+  }
+
+  FolderRoot._(Map m) {
+    token = m['token'];
+  }
+
+  String get id => token;
+
+  Resource createResource(Workspace workspace) => new Project(workspace, this);
+
+  Future restore() {
+    return _chromeHelper.restoreEntry(token).then((e) {
+      entry = e;
+    });
+  }
+
+  Map persistState() {
+    if (token == null) return null;
+
+    return {
+      'type': 'folder',
+      'token': token
+    };
+  }
+}
+
+/**
+ * A workspace root that represents a folder inside a folder selected by the
+ * user.
+ */
+class FolderChildRoot extends WorkspaceRoot {
+  String parentToken;
+  String name;
+
+  FolderChildRoot(chrome.DirectoryEntry parent, chrome.DirectoryEntry folderEntry) {
+    parentToken = _chromeHelper.retainEntry(parent);
+    entry = folderEntry;
+    name = folderEntry.name;
+  }
+
+  FolderChildRoot._(Map m) {
+    parentToken = m['parentToken'];
+    name = m['name'];
+  }
+
+  String get id => '${parentToken}-${name}';
+
+  Resource createResource(Workspace workspace) => new Project(workspace, this);
+
+  Future restore() {
+    return _chromeHelper.restoreEntry(parentToken).then((parent) {
+      return parent.getDirectory(name).then((e) {
+        entry = e;
+      });
+    });
+  }
+
+  Map persistState() {
+    return {
+      'type': 'folderChild',
+      'parentToken': parentToken,
+      'name': name
+    };
+  }
+}
+
+/**
+ * A workspace root that represents a folder on the sync file system.
+ */
+class SyncFolderRoot extends WorkspaceRoot {
+
+  SyncFolderRoot(chrome.DirectoryEntry folderEntry) {
+    entry = folderEntry;
+  }
+
+  String get id => '\$sync-${entry.name}';
+
+  Resource createResource(Workspace workspace) => new Project(workspace, this);
+
+  // Nothing to restore - these are created differently.
+  Future restore() => new Future.value();
+
+  // We do not persist infomation about the sync filesystem root.
+  Map persistState() => null;
 }
 
 /**
@@ -722,7 +949,8 @@ class ResourceChangeEvent {
     return new ResourceChangeEvent._(deltas.toList());
   }
 
-  ResourceChangeEvent._(List<ChangeDelta> delta): changes = new UnmodifiableListView(delta);
+  ResourceChangeEvent._(List<ChangeDelta> delta) :
+    changes = new UnmodifiableListView(delta);
 
   /**
    * A convenience getter used to return modified (new or changed) files.
@@ -730,6 +958,14 @@ class ResourceChangeEvent {
   Iterable<File> get modifiedFiles => changes
       .where((delta) => !delta.isDelete && delta.resource is File)
       .map((delta) => delta.resource);
+
+  /**
+   * Returns an [Iterable] of the changed projects in this event.
+   */
+  Iterable<Project> get modifiedProjects => changes
+      .map((delta) => delta.resource.project)
+      .toSet()
+      .where((project) => project != null);
 }
 
 /**
@@ -862,7 +1098,8 @@ class MarkerChangeEvent {
     return new MarkerChangeEvent._(deltas.toList());
   }
 
-  MarkerChangeEvent._(List<MarkerDelta> delta): changes = new UnmodifiableListView(delta);
+  MarkerChangeEvent._(List<MarkerDelta> delta) :
+    changes = new UnmodifiableListView(delta);
 
   /**
    * Checks if the given [File] is present in the list of marker changes.
@@ -887,4 +1124,53 @@ class MarkerDelta {
   bool get isDelete => type == EventType.DELETE;
 
   String toString() => '${type}: ${marker}';
+}
+
+/**
+ * Cache lookups into retained file entries, so that the same entry retained
+ * twice will return the same id.
+ */
+class _ChromeHelper {
+  Map<String, chrome.Entry> _map = {};
+
+  String retainEntry(chrome.Entry entry) {
+    for (String key in _map.keys) {
+      if (_map[key] == entry) {
+        return key;
+      }
+    }
+
+    String id = chrome.fileSystem.retainEntry(entry);
+    _map[id] = entry;
+    return id;
+  }
+
+  Future<chrome.Entry> restoreEntry(String id) {
+    if (_map.containsKey(id)) {
+      return new Future.value(_map[id]);
+    } else {
+      return chrome.fileSystem.restoreEntry(id).then((entry) {
+        _map[id] = entry;
+        return entry;
+      });
+    }
+  }
+}
+
+/**
+ * Run the given closure in a timer task.
+ */
+Future _runInTimer(var closure) {
+  Completer completer = new Completer();
+
+  Timer.run(() {
+    var result = closure();
+    if (result is Future) {
+      result.whenComplete(() => completer.complete());
+    } else {
+      completer.complete();
+    }
+  });
+
+  return completer.future;
 }

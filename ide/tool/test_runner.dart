@@ -53,26 +53,22 @@ void main([List<String> args = const []]) {
   }
 
   if (results['chrome'] || results['chrome-stable']) {
-    //appPath = 'app';
     appPath = 'build/deploy-out/web';
-    //browserPath = _chromeStablePath();
-    browserPath = _dartiumPath();
+    browserPath = _chromeStablePath();
   }
 
   if (results['chrome-dev']) {
-    //appPath = 'app';
     appPath = 'build/deploy-out/web';
-    //browserPath = _chromeDevPath();
-    browserPath = _dartiumPath();
+    browserPath = _chromeDevPath();
   }
 
-//  if (results['appPath'] != null) {
-//    appPath = results['appPath'];
-//  }
-//
-//  if (results['browserPath'] != null) {
-//    browserPath = results['browserPath'];
-//  }
+  if (results['appPath'] != null) {
+    appPath = results['appPath'];
+  }
+
+  if (results['browserPath'] != null) {
+    browserPath = results['browserPath'];
+  }
 
   if (appPath == null || browserPath == null) {
     _printUsage(parser);
@@ -106,7 +102,6 @@ void runApp(String browserPath, String appPath, {bool verbose: false}) {
   }
 
   if (Platform.isMacOS) {
-    // TODO: does this work on OSes other then mac?
     args.add('--no-startup-window');
   }
 
@@ -150,8 +145,8 @@ ArgParser _createArgsParser() {
       help: 'show more logs when running unit tests in chrome',
       negatable: false);
 
-//  parser.addOption('appPath', help: 'the application path to run');
-//  parser.addOption('browserPath', help: 'the path to chrome');
+  parser.addOption('appPath', help: 'the application path to run');
+  parser.addOption('browserPath', help: 'the path to chrome');
 
   return parser;
 }
@@ -176,7 +171,14 @@ String _dartiumPath() {
 
   String sep = Platform.pathSeparator;
   String os = Platform.operatingSystem;
-  String path = "${sdkDir.path}${sep}..${sep}chromium${sep}${m[os]}";
+  String dartSdkPath = sdkDir.path;
+
+  // Truncate any trailing /s
+  if (dartSdkPath.endsWith(sep)) {
+    dartSdkPath = dartSdkPath.substring(0, dartSdkPath.length - 1);
+  }
+
+  String path = "${dartSdkPath}${sep}..${sep}chromium${sep}${m[os]}";
 
   if (FileSystemEntity.isFileSync(path)) {
     return new File(path).absolute.path;
@@ -202,13 +204,14 @@ String _chromeStablePath() {
       }
     }
   }
+
+  throw 'unable to locate Chrome; ${Platform.operatingSystem} not yet supported';
 }
 
 String _chromeDevPath() {
   if (Platform.isLinux) {
     return '/usr/bin/google-chrome-unstable';
   } else {
-    // TODO:
     throw 'unable to locate Chrome dev; ${Platform.operatingSystem} not yet supported';
   }
 }

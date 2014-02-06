@@ -13,26 +13,33 @@ import 'dart:js' as js;
 import 'dart:math' as math;
 
 import 'package:ace/ace.dart' as ace;
+import 'package:ace/proxy.dart';
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:path/path.dart' as path;
 
-import 'workspace.dart' as workspace;
 import 'editors.dart';
 import 'preferences.dart';
 import 'utils.dart' as utils;
+import 'workspace.dart' as workspace;
 
 export 'package:ace/ace.dart' show EditSession;
+
+import '../packages/spark_widgets/spark_button/spark_button.dart';
 
 class TextEditor extends Editor {
   final AceManager aceManager;
   final workspace.File file;
 
+  StreamSubscription _aceSubscription;
   StreamController _dirtyController = new StreamController.broadcast();
 
   ace.EditSession _session;
 
+  String _lastSavedHash;
+
   void setSession(ace.EditSession value) {
     _session = value;
-    _session.onChange.listen((_) => dirty = true);
+    _aceSubscription = _session.onChange.listen((_) => dirty = true);
   }
 
   bool _dirty = false;
@@ -61,11 +68,54 @@ class TextEditor extends Editor {
 
   void focus() => aceManager.focus();
 
+  void fileContentsChanged() {
+    if (_session != null) {
+      // Check that we didn't cause this change event.
+      file.getContents().then((String text) {
+        String fileContentsHash = _calcMD5(text);
+
+        if (fileContentsHash != _lastSavedHash) {
+          _lastSavedHash = fileContentsHash;
+          _replaceContents(text);
+        }
+      });
+    }
+  }
+
   Future save() {
+    // We store a hash of the contents when saving. When we get a change
+    // notification (in fileContentsChanged()), we compare the last write to the
+    // contents on disk.
     if (_dirty) {
-      return file.setContents(_session.value).then((_) => dirty = false);
+      String text = _session.value;
+      _lastSavedHash = _calcMD5(text);
+      return file.setContents(text).then((_) => dirty = false);
     } else {
       return new Future.value();
+    }
+  }
+
+  /**
+   * Replace the editor's contents with the given text. Make sure that we don't
+   * fire a change event.
+   */
+  void _replaceContents(String newContents) {
+    _aceSubscription.cancel();
+
+    try {
+      // Restore the cursor position and scroll location.
+      int scrollTop = _session.scrollTop;
+      html.Point cursorPos = null;
+      if (aceManager.currentFile == file) {
+        cursorPos = aceManager.cursorPosition;
+      }
+      _session.value = newContents;
+      _session.scrollTop = scrollTop;
+      if (cursorPos != null) {
+        aceManager.cursorPosition = cursorPos;
+      }
+    } finally {
+      _aceSubscription = _session.onChange.listen((_) => dirty = true);
     }
   }
 }
@@ -85,17 +135,21 @@ class AceManager {
    * The container for the Ace editor.
    */
   final html.Element parentElement;
+  final AceManagerDelegate delegate;
 
   ace.Editor _aceEditor;
 
   workspace.Marker _currentMarker;
+
+  StreamSubscription<ace.FoldChangeEvent> _foldListenerSubscription;
 
   static bool get available => js.context['ace'] != null;
 
   StreamSubscription _markerSubscription;
   workspace.File currentFile;
 
-  AceManager(this.parentElement) {
+  AceManager(this.parentElement, this.delegate) {
+    ace.implementation = ACE_PROXY_IMPLEMENTATION;
     _aceEditor = ace.edit(parentElement);
     _aceEditor.renderer.fixedWidthGutter = true;
     _aceEditor.highlightActiveLine = false;
@@ -112,6 +166,13 @@ class AceManager {
     theme = THEMES[0];
   }
 
+  bool isFileExtensionEditable(String extension) {
+    if (extension.startsWith('.')) {
+      extension = extension.substring(1);
+    }
+    return ace.Mode.extensionMap[extension] != null;
+  }
+
   html.Element get _editorElement => parentElement.parent;
 
   html.Element get _minimapElement {
@@ -124,25 +185,54 @@ class AceManager {
     return null;
   }
 
+  String _formatAnnotationItemText(String text, [String type]) {
+    String labelHtml = "";
+    if (type != null) {
+      String typeText = type.substring(0, 1).toUpperCase() + type.substring(1);
+      labelHtml = "<span class=ace_gutter-tooltip-label-$type>$typeText: </span>";
+    }
+    return "$labelHtml$text";
+  }
+
   void setMarkers(List<workspace.Marker> markers) {
     List<ace.Annotation> annotations = [];
     int numberLines = currentSession.screenLength;
 
     _recreateMiniMap();
+    Map<int, ace.Annotation> annotationByRow = new Map<int, ace.Annotation>();
 
     for (workspace.Marker marker in markers) {
       String annotationType = _convertMarkerSeverity(marker.severity);
-      var annotation = new ace.Annotation(
-          text: marker.message,
-          row: marker.lineNum - 1, // Ace uses 0-based lines.
+
+      // Style the marker with the annotation type.
+      String markerHtml = _formatAnnotationItemText(marker.message,
+          annotationType);
+
+      // Ace uses 0-based lines.
+      ace.Point charPoint = currentSession.document.indexToPosition(marker.charStart);
+      int aceRow = charPoint.row;
+      int aceColumn = charPoint.column;
+
+      // If there is an existing annotation, delete it and combine into one.
+      var existingAnnotation = annotationByRow[aceRow];
+      if (existingAnnotation != null) {
+        markerHtml = existingAnnotation.html
+            + "<div class=\"ace_gutter-tooltip-divider\"></div>$markerHtml";
+        annotations.remove(existingAnnotation);
+      }
+
+      ace.Annotation annotation = new ace.Annotation(
+          html: markerHtml,
+          row: aceRow,
           type: annotationType);
       annotations.add(annotation);
+      annotationByRow[aceRow] = annotation;
 
-      // TODO(ericarnold): This won't update on code folds.  Fix
       // TODO(ericarnold): This should also be based upon annotations so ace's
       //     immediate handling of deleting / adding lines gets used.
       double markerPos =
-          currentSession.documentToScreenRow(marker.lineNum, 0) / numberLines * 100.0;
+          currentSession.documentToScreenRow(marker.lineNum, aceColumn)
+          / numberLines * 100.0;
 
       html.Element minimapMarker = new html.Element.div();
       minimapMarker.classes.add("minimap-marker ${marker.severityDescription}");
@@ -194,6 +284,9 @@ class AceManager {
   }
 
   void _recreateMiniMap() {
+    if (_editorElement == null) {
+      return;
+    }
     html.Element scrollbarElement =
         _editorElement.getElementsByClassName("ace_scrollbar").first;
     if (scrollbarElement.style.right != "10px") {
@@ -208,6 +301,55 @@ class AceManager {
     } else {
       _editorElement.append(miniMap);
     }
+  }
+
+  /**
+   * Show an overlay dialog to tell the user that a binary file cannot be
+   * shown.
+   *
+   * TODO(dvh): move this logic to editors/editor_area.
+   * See https://github.com/dart-lang/spark/issues/906
+   */
+  void createDialog(String filename) {
+    if (_editorElement == null) {
+      return;
+    }
+    html.Element dialog = _editorElement.querySelector('.editor-dialog');
+    if (dialog != null) {
+      // Dialog already exists.
+      return;
+    }
+
+    dialog = new html.Element.div();
+    dialog.classes.add("editor-dialog");
+
+    // Add an overlay dialog using the template #editor-dialog.
+    html.DocumentFragment template =
+        (html.querySelector('#editor-dialog') as html.TemplateElement).content;
+    html.DocumentFragment templateClone = template.clone(true);
+    html.Element element = templateClone.querySelector('.editor-dialog');
+    element.classes.remove('editor-dialog');
+    dialog.append(element);
+
+    // Set actions of the dialog.
+    SparkButton button = dialog.querySelector('.view-as-text-button');
+    button.onClick.listen((_) {
+      dialog.classes.add("transition-hidden");
+      focus();
+    });
+    html.Element link = dialog.querySelector('.always-view-as-text-button');
+    link.onClick.listen((_) {
+      dialog.classes.add("transition-hidden");
+      String extention = path.extension(currentFile.name);
+      delegate.setAlwaysShowAsText(extention, true);
+      focus();
+    });
+
+    if (delegate.canShowFileAsText(filename)) {
+      dialog.classes.add('hidden');
+    }
+
+    _editorElement.append(dialog);
   }
 
   void clearMarkers() => currentSession.clearAnnotations();
@@ -269,6 +411,11 @@ class AceManager {
   ace.EditSession get currentSession => _aceEditor.session;
 
   void switchTo(ace.EditSession session, [workspace.File file]) {
+    if (_foldListenerSubscription != null) {
+      _foldListenerSubscription.cancel();
+      _foldListenerSubscription = null;
+    }
+
     if (session == null) {
       _aceEditor.session = ace.createEditSession('', new ace.Mode('ace/mode/text'));
       _aceEditor.readOnly = true;
@@ -278,6 +425,13 @@ class AceManager {
       if (_aceEditor.readOnly) {
         _aceEditor.readOnly = false;
       }
+
+      _foldListenerSubscription = currentSession.onChangeFold.listen((_) {
+        setMarkers(file.getMarkers());
+      });
+
+      // TODO(ericarnold): Markers aren't shown until file is edited.  Fix.
+      setMarkers(file.getMarkers());
     }
 
     // Setup the code completion options for the current file type.
@@ -285,9 +439,6 @@ class AceManager {
       currentFile = file;
       _aceEditor.setOption(
           'enableBasicAutocompletion', path.extension(file.name) != '.dart');
-
-      // TODO(ericarnold): Markers aren't shown until file is edited.  Fix.
-      setMarkers(currentFile.getMarkers());
 
       if (_markerSubscription == null) {
         _markerSubscription = file.workspace.onMarkerChange.listen(
@@ -308,7 +459,7 @@ class AceManager {
         return ace.Annotation.ERROR;
       case workspace.Marker.SEVERITY_WARNING:
         return ace.Annotation.WARNING;
-      case workspace.Marker.SEVERITY_INFO:
+      default:
         return ace.Annotation.INFO;
     }
   }
@@ -350,7 +501,7 @@ class ThemeManager {
   }
 
   void _updateName(String name) {
-    _label.text = utils.capitalize(name.replaceAll('_', ' '));
+    _label.text = utils.toTitleCase(name.replaceAll('_', ' '));
   }
 }
 
@@ -390,6 +541,24 @@ class KeyBindingManager {
   }
 
   void _updateName(String name) {
-    _label.text = (name == null ? 'default' : utils.capitalize(name));
+    _label.text = (name == null ? 'Default' : utils.capitalize(name));
   }
+}
+
+abstract class AceManagerDelegate {
+  /**
+   * Mark the files with the given file extension as editable in text format.
+   */
+  void setAlwaysShowAsText(String extension, bool enabled);
+
+  /**
+   * Returns true if the file with the given filename can be edited as text.
+   */
+  bool canShowFileAsText(String filename);
+}
+
+String _calcMD5(String text) {
+  crypto.MD5 md5 = new crypto.MD5();
+  md5.add(text.codeUnits);
+  return crypto.CryptoUtils.bytesToHex(md5.close());
 }

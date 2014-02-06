@@ -6,9 +6,11 @@ library git.commands.commit;
 
 import 'dart:async';
 import 'dart:typed_data';
-
 import 'package:chrome/chrome_app.dart' as chrome;
 
+import 'constants.dart';
+import 'index.dart';
+import 'status.dart';
 import '../file_operations.dart';
 import '../object.dart';
 import '../object_utils.dart';
@@ -35,28 +37,38 @@ class Commit {
 
       List<TreeEntry> treeEntries = [];
 
-      return Future.forEach(entries, (chrome.ChromeFileEntry entry) {
+      return Future.forEach(entries, (chrome.Entry entry) {
         if (entry.name == '.git') {
           return null;
         }
 
         if (entry.isDirectory) {
-          return walkFiles(entry as chrome.DirectoryEntry, store).then(
-              (String sha) {
+          return walkFiles(entry as chrome.DirectoryEntry, store).then((String sha) {
             if (sha != null) {
-              treeEntries.add(new TreeEntry(entry.name, shaToBytes(sha),
-                  false));
+              treeEntries.add(new TreeEntry(entry.name, shaToBytes(sha), false));
             }
           });
         } else {
-          return entry.readBytes().then(
-              (chrome.ArrayBuffer buf) {
-                return store.writeRawObject('blob', new Uint8List.fromList(
-                    buf.getBytes()));
-              }).then((String sha) {
+          chrome.ChromeFileEntry fileEntry = entry;
+
+          return Status.getFileStatus(store, entry).then((FileStatus status) {
+            return store.index.updateIndexForEntry(status).then((_) {
+              status = store.index.getStatusForEntry(entry);
+
+              if (status.type != FileStatusType.COMMITTED) {
+                return fileEntry.readBytes().then((chrome.ArrayBuffer buf) {
+                  return store.writeRawObject(
+                      'blob', new Uint8List.fromList(buf.getBytes()));
+                }).then((String sha) {
+                  treeEntries.add(new TreeEntry(entry.name, shaToBytes(sha), true));
+                  return store.index.commitEntry(status).then((_) => null);
+                });
+              } else {
                 treeEntries.add(
-                    new TreeEntry(entry.name, shaToBytes(sha), true));
-              });
+                    new TreeEntry(entry.name, shaToBytes(status.sha), true));
+              }
+            });
+          });
         }
       }).then((_) {
         treeEntries.sort((TreeEntry a, TreeEntry b) {
@@ -74,7 +86,7 @@ class Commit {
     if (parent.isEmpty) {
       return null;
     } else {
-      return store.retrieveObject(parent, ObjectTypes.COMMIT).then(
+      return store.retrieveObject(parent, ObjectTypes.COMMIT_STR).then(
           (CommitObject parentCommit) {
         String oldTree = parentCommit.treeSha;
         if (oldTree == sha) {
@@ -111,20 +123,14 @@ class Commit {
       String refName) {
     chrome.DirectoryEntry dir = options.root;
     ObjectStore store = options.store;
-    String name = options.name;
-    String email = options.email;
-    String commitMsg = options.commitMessage;
+    String name = options.name == null ? "" : options.name;
+    String email = options.email == null ? "" : options.email;
+    String commitMsg = options.commitMessage == null ? ""
+        : options.commitMessage;
 
     return walkFiles(dir, store).then((String sha) {
       return checkTreeChanged(store, parent, sha).then((_) {
-        DateTime now = new DateTime.now();
-        String dateString =
-            (now.millisecondsSinceEpoch / 1000).floor().toString();
-        int offset = (now.timeZoneOffset.inHours).floor();
-        int absOffset = offset.abs().floor();
-        String offsetStr = ' ' + (offset < 0 ? '-' : '+');
-        offsetStr += (absOffset < 10 ? '0' : '') + '${absOffset}00';
-        dateString += offsetStr;
+        String dateString = getCurrentTimeAsString();
         StringBuffer commitContent = new StringBuffer();
         commitContent.write('tree ${sha}\n');
         if (parent != null && parent.length > 0) {
@@ -134,21 +140,16 @@ class Commit {
           }
         }
 
-        commitContent.write('author ${name} ');
-        commitContent.write(' <$email> ');
-        commitContent.write(dateString);
-        commitContent.write('\n');
-        commitContent.write('committer ${name}');
-        commitContent.write(' <${email}> ');
-        commitContent.write(dateString);
+        commitContent.write('author ${name} <${email}> ${dateString}\n');
+        commitContent.write('committer ${name} <${email}> ${dateString}');
         commitContent.write('\n\n${commitMsg}\n');
 
         return store.writeRawObject(
-            ObjectTypes.COMMIT, commitContent.toString()).then(
+            ObjectTypes.COMMIT_STR, commitContent.toString()).then(
                 (String commitSha) {
           return FileOps.createFileWithContent(dir, '.git/${refName}',
               commitSha + '\n', 'Text').then((_) {
-                return store.updateLastChange(null).then((_) => commitSha);
+                return store.writeConfig().then((_) => commitSha);
           });
         });
       });

@@ -3,7 +3,7 @@
   "name": "__MSG_app_name__",
   "short_name": "__MSG_app_name__",
   "description": "__MSG_app_description__",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "minimum_chrome_version": "31",
   "manifest_version": 2,
   "default_locale": "en",
@@ -26,6 +26,7 @@
     "http://pajamallama0.syd.corp.google.com:8080/*",
     "clipboardRead",
     "clipboardWrite",
+    "developerPrivate",
     {
       "fileSystem": [
         "write",
@@ -42,8 +43,7 @@
     "syncFileSystem",
     "storage",
     "webview",
-    "contextMenus",
-    "app.window"
+    "contextMenus"
   ],
   "file_handlers": {
     "text": {

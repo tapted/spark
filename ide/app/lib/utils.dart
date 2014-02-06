@@ -4,6 +4,7 @@
 
 library spark.utils;
 
+import 'dart:html' as html;
 import 'dart:web_audio';
 
 import 'package:chrome/chrome_app.dart' as chrome;
@@ -16,6 +17,24 @@ String i18n(String messageId) => chrome.i18n.getMessage(messageId);
 String capitalize(String s) {
   return s.isEmpty ? '' : (s[0].toUpperCase() + s.substring(1));
 }
+
+/**
+ * Returns a reasonable approximation of the given string converted into title
+ * case. All words are capitalized with the exception of short ones.
+ */
+String toTitleCase(String s) {
+  return s.split(' ').map((word) {
+    if (word.length <= 2 || word == 'and' || word == 'the') {
+      return word;
+    } else {
+      return capitalize(word);
+    }
+  }).join(' ');
+}
+
+bool isMac() => _platform().indexOf('mac') != -1;
+bool isWin() => _platform().indexOf('win') != -1;
+bool isLinuxLike() => !isMac() && !isWin();
 
 AudioContext _ctx;
 
@@ -187,4 +206,9 @@ String _minimizeLine(String line) {
  */
 String _removeExtPrefix(String str) {
   return str.replaceFirst(new RegExp("chrome-extension://[a-z0-9]+/"), "");
+}
+
+String _platform() {
+  String str = html.window.navigator.platform;
+  return (str != null) ? str.toLowerCase() : '';
 }

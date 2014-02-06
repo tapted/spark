@@ -9,20 +9,25 @@ library spark.launch;
 
 import 'dart:async';
 import 'dart:html' as html;
+import 'dart:js' as js;
 import 'dart:typed_data' as typed_data;
 
 import 'package:chrome/chrome_app.dart' as chrome;
 import 'package:js/js.dart' as js;
+import 'package:intl/intl.dart';
 import 'package:logging/logging.dart';
 import 'package:tavern/tavern.dart' as tavern;
 
 import 'compiler.dart';
+import 'utils.dart';
 import 'server.dart';
 import 'workspace.dart';
 
 const int SERVER_PORT = 4040;
 
 final Logger _logger = new Logger('spark.launch');
+
+final NumberFormat _NF = new NumberFormat.decimalPattern();
 
 /**
  * Manages all the launches and calls the appropriate delegate.
@@ -43,7 +48,6 @@ class LaunchManager {
   LaunchManager(this._workspace) {
     _delegates.add(new DartWebAppLaunchDelegate(this));
     _delegates.add(new ChromeAppLaunchDelegate());
-
   }
 
   /**
@@ -96,6 +100,9 @@ class DartWebAppLaunchDelegate extends LaunchDelegate {
       _server.addServlet(new StaticResourcesServlet());
       _server.addServlet(_dart2jsServlet);
       _server.addServlet(new WorkspaceServlet(_launchManager));
+    }).catchError((error) {
+      // TODO: We could fallback to binding to any port.
+      _logger.severe('Error starting up embedded server', error);
     });
   }
 
@@ -107,14 +114,19 @@ class DartWebAppLaunchDelegate extends LaunchDelegate {
   void run(Resource resource) {
     _launchManager._currentProject = resource.project;
     // Use htm extension for launch page, otherwise polymer build tries to pick it up.
-    chrome.app.window.create('launch_page.htm',
-        new chrome.CreateWindowOptions(id: 'runWindow', width: 600, height: 800))
-      .then((_) {},
-          onError: (e) => _logger.log(Level.INFO, 'Error launching Dart web app', e));
+    var options = new chrome.CreateWindowOptions(
+        id: 'runWindow',
+        width: 800, height: 570,
+        minWidth: 800, minHeight: 570);
+    chrome.app.window.create('launch_page/launch_page.htm', options).catchError((e) {
+      _logger.log(Level.INFO, 'Error launching Dart web app', e);
+    });
   }
 
   void dispose() {
-    _server.dispose();
+    if (_server != null) {
+      _server.dispose();
+    }
     _dart2jsServlet.dispose();
   }
 }
@@ -134,10 +146,54 @@ class ChromeAppLaunchDelegate extends LaunchDelegate {
       resource.entry.getParent().then((parent) {
         tavern.getDependencies(parent, js.context.logMessage);
       });
-    } else {
-      //TODO: implement this
-      print('TODO: run project ${resource.project}');
+      return;
     }
+    print('TODO: run project ${resource.project}');
+    if (!isDart2js()) {
+      return;
+    }
+    _loadApp(resource).then((_) {
+      _getAppId(resource.project.name).then((String id) {
+        _launchApp(id);
+      });
+    });
+  }
+
+  Future<String> _loadApp(Resource resource) {
+    Completer completer = new Completer();
+    callback(String id) {
+      completer.complete(id);
+    }
+
+    js.JsObject obj = js.context['chrome']['developerPrivate'];
+    obj.callMethod('LoadDirectory', [resource.project.entry, callback]);
+    return completer.future;
+  }
+
+  void _launchApp(String id) {
+    js.JsObject obj = js.context['chrome']['management'];
+    obj.callMethod('launchApp', [id]);
+  }
+
+  /**
+   * TODO(grv) : This is a temporary function until loadDirectory returns
+   *  the app_id.
+   */
+  Future<String> _getAppId(String name) {
+    Completer completer = new Completer();
+    callback(List result) {
+      for (int i = 0; i < result.length; ++i) {
+        if (result[i]['is_unpacked'] && (result[i]['path'] as String).endsWith(
+            name)) {
+          completer.complete(result[i]['id']);
+          return;
+        }
+      };
+      completer.complete(null);
+    }
+    js.JsObject obj = js.context['chrome']['developerPrivate'];
+    obj.callMethod('getItemsInfo', [false, false, callback]);
+    return completer.future;
   }
 
   void dispose() {
@@ -167,7 +223,9 @@ class WorkspaceServlet extends PicoServlet {
     if (path.startsWith('/')) {
       path = path.substring(1);
     }
+
     Resource resource = _launchManager.workspace.getChildPath(path);
+
     if (resource != null) {
       // TODO: Verify that the resource is a File.
       return (resource as File).getBytes().then((chrome.ArrayBuffer buffer) {
@@ -176,7 +234,7 @@ class WorkspaceServlet extends PicoServlet {
         return new Future.value(response);
       }, onError: (_) => new Future.value(new HttpResponse.notFound()));
     } else {
-      new Future.value(new HttpResponse.notFound());
+      return new Future.value(new HttpResponse.notFound());
     }
   }
 }
@@ -215,14 +273,24 @@ class ProjectRedirectServlet extends PicoServlet {
   }
 
   Future<HttpResponse> serve(HttpRequest request) {
-    HttpResponse response = new HttpResponse.ok();
-    // TODO: for now landing page is hardcoded to project/web/index.html
-    String string ='$HTML_REDIRECT${_launchManager.currentProject.name}/web/index.html">';
-    response.setContent(string);
-    response.setContentTypeFrom('redirect.html');
+    // TODO: For now the landing page is hardcoded to project/web/index.html.
+    String url = 'http://127.0.0.1:$SERVER_PORT/${_projectName}/web/index.html';
+
+    // Issue a 302 redirect.
+    HttpResponse response = new HttpResponse(statusCode: HttpStatus.FOUND);
+    response.headers.set(HttpHeaders.LOCATION, url);
+    response.headers.set(HttpHeaders.CONTENT_LENGTH, 0);
+
     return new Future.value(response);
   }
+
+  String get _projectName => _launchManager.currentProject.name;
 }
+
+// 3 successive launches; dart2js warms up quite a bit.
+// [INFO] spark.launch: compiled /solar/web/solar.dart in 6,446 ms
+// [INFO] spark.launch: compiled /solar/web/solar.dart in 2,928 ms
+// [INFO] spark.launch: compiled /solar/web/solar.dart in 2,051 ms
 
 /**
  * Servlet that compiles and serves up the JavaScript for Dart sources.
@@ -256,22 +324,25 @@ class Dart2JsServlet extends PicoServlet {
 
     Resource resource = _getResource(request.uri.path);
 
+    Stopwatch stopwatch = new Stopwatch();
+    stopwatch.start();
+
     return (resource as File).getContents().then((String string) {
       // TODO: compiler should also accept files
       return _compiler.compileString(string).then((CompilerResult result) {
+        _logger.info('compiled ${resource.path} in '
+            '${_NF.format(stopwatch.elapsedMilliseconds)} ms');
         response.setContent(result.output);
-        response.setContentTypeFrom('resource.js');
+        response.setContentTypeFrom(request.uri.path);
         return new Future.value(response);
       });
     });
-
   }
 
   void dispose() {
     _compiler.dispose();
   }
 }
-
 
 /**
  * Return the contents of the file at the given path. The path is relative to

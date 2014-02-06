@@ -22,6 +22,7 @@ import 'widgets/treeview_cell.dart';
 import 'widgets/treeview_delegate.dart';
 import '../actions.dart';
 import '../preferences.dart' as preferences;
+import '../scm.dart';
 import '../workspace.dart';
 
 class FilesController implements TreeViewDelegate {
@@ -29,6 +30,8 @@ class FilesController implements TreeViewDelegate {
   TreeView _treeView;
   // Workspace that references all the resources.
   Workspace _workspace;
+  // The SCMManager is used to help us decorate files with their SCM status.
+  ScmManager _scmManager;
   // List of top-level resources.
   List<Resource> _files;
   // Implements callbacks required for the FilesController.
@@ -43,9 +46,11 @@ class FilesController implements TreeViewDelegate {
   StreamController<Resource> _selectionController = new StreamController.broadcast();
 
   FilesController(Workspace workspace,
+                  ScmManager scmManager,
                   FilesControllerDelegate delegate,
                   html.Element fileViewArea) {
     _workspace = workspace;
+    _scmManager = scmManager;
     _delegate = delegate;
     _files = [];
     _filesMap = {};
@@ -67,13 +72,12 @@ class FilesController implements TreeViewDelegate {
       }
     });
 
-    _workspace.onMarkerChange.listen((_) {
-      _processMarkerChange();
-    });
+    _workspace.onMarkerChange.listen((_) => _processMarkerChange());
+    _scmManager.onStatusChange.listen((_) => _processScmChange());
   }
 
   bool isFileSelected(Resource file) {
-    return _treeView.selection.contains(file.path);
+    return _treeView.selection.contains(file.uuid);
   }
 
   void selectFile(Resource file, {bool forceOpen: false}) {
@@ -84,17 +88,17 @@ class FilesController implements TreeViewDelegate {
     List parents = _collectParents(file, []);
 
     parents.forEach((Container container) {
-      if (!_treeView.isNodeExpanded(container.path)) {
-        _treeView.setNodeExpanded(container.path, true);
+      if (!_treeView.isNodeExpanded(container.uuid)) {
+        _treeView.setNodeExpanded(container.uuid, true);
       }
     });
 
-    _treeView.selection = [file.path];
+    _treeView.selection = [file.uuid];
     if (file is File) {
       _delegate.selectInEditor(file, forceOpen: forceOpen);
     }
     _selectionController.add(file);
-    _treeView.scrollIntoNode(file.path, html.ScrollAlignment.CENTER);
+    _treeView.scrollIntoNode(file.uuid, html.ScrollAlignment.CENTER);
   }
 
   void selectFirstFile({bool forceOpen: false}) {
@@ -106,12 +110,12 @@ class FilesController implements TreeViewDelegate {
 
   void setFolderExpanded(Container resource) {
     for (Container container in _collectParents(resource, [])) {
-      if (!_treeView.isNodeExpanded(container.path)) {
-        _treeView.setNodeExpanded(container.path, true);
+      if (!_treeView.isNodeExpanded(container.uuid)) {
+        _treeView.setNodeExpanded(container.uuid, true);
       }
     }
 
-    _treeView.setNodeExpanded(resource.path, true);
+    _treeView.setNodeExpanded(resource.uuid, true);
   }
 
   /**
@@ -142,7 +146,7 @@ class FilesController implements TreeViewDelegate {
 
   String treeViewChild(TreeView view, String nodeUID, int childIndex) {
     if (nodeUID == null) {
-      return _files[childIndex].path;
+      return _files[childIndex].uuid;
     } else {
       _cacheChildren(nodeUID);
       return _childrenCache[nodeUID][childIndex];
@@ -163,6 +167,7 @@ class FilesController implements TreeViewDelegate {
     if (resource is Folder) {
       cell.acceptDrop = true;
     }
+    _updateScmInfo(cell);
     return cell;
   }
 
@@ -188,7 +193,7 @@ class FilesController implements TreeViewDelegate {
     if (resource is File) {
       bool altKeyPressed = event.altKey;
       bool shiftKeyPressed = event.shiftKey;
-      bool ctrlKeyPressed = event.ctrlKey || event.metaKey;
+      bool ctrlKeyPressed = event.ctrlKey;
 
       // Open in editor only if alt key or no modifier key is down.  If alt key
       // is pressed, it will open a new tab.
@@ -262,7 +267,7 @@ class FilesController implements TreeViewDelegate {
     Set<String> ancestorsUIDs = new Set();
     Resource currentNode = destination;
     while (currentNode != null) {
-      ancestorsUIDs.add(currentNode.path);
+      ancestorsUIDs.add(currentNode.uuid);
       currentNode = currentNode.parent;
     }
     // Make sure that source items are not one of them.
@@ -501,7 +506,7 @@ class FilesController implements TreeViewDelegate {
     if (_childrenCache[nodeUID] == null) {
       Container container = _filesMap[nodeUID];
       _childrenCache[nodeUID] = container.getChildren().
-          where(_showResource).map((r) => r.path).toList();
+          where(_showResource).map((r) => r.uuid).toList();
       _childrenCache[nodeUID].sort(
           (String a, String b) => a.toLowerCase().compareTo(b.toLowerCase()));
     }
@@ -574,6 +579,7 @@ class FilesController implements TreeViewDelegate {
         _recursiveAddResource(resource);
       }
     });
+
     _reloadData();
   }
 
@@ -601,8 +607,36 @@ class FilesController implements TreeViewDelegate {
     }
   }
 
+  void _processScmChange() {
+    for (String uid in _filesMap.keys) {
+      TreeViewCell treeViewCell = _treeView.getTreeViewCellForUID(uid);
+      if (treeViewCell != null) {
+        _updateScmInfo(treeViewCell.embeddedCell);
+      }
+    }
+  }
+
+  void _updateScmInfo(FileItemCell fileItemCell) {
+    Resource resource = fileItemCell.resource;
+    ScmProjectOperations scmOperations =
+        _scmManager.getScmOperationsFor(resource.project);
+
+    if (scmOperations != null) {
+      if (resource is Project) {
+        String branchName = scmOperations.getBranchName();
+        final String repoIcon = '<span class="glyphicon glyphicon-random small"></span>';
+        if (branchName == null) branchName = '';
+        fileItemCell.setFileInfo('${repoIcon} [${branchName}]');
+      } else {
+        FileStatus status = scmOperations.getFileStatus(resource);
+        // TODO: We'll need to add a few more status states.
+        fileItemCell.setGitStatus(dirty: (status == FileStatus.DIRTY));
+      }
+    }
+  }
+
   void _recursiveAddResource(Resource resource) {
-    _filesMap[resource.path] = resource;
+    _filesMap[resource.uuid] = resource;
     if (resource is Container) {
       resource.getChildren().forEach((child) {
         if (_showResource(child)) {
@@ -613,24 +647,12 @@ class FilesController implements TreeViewDelegate {
   }
 
   void _recursiveRemoveResource(Resource resource) {
-    _filesMap.remove(resource.path);
+    _filesMap.remove(resource.uuid);
     if (resource is Container) {
       resource.getChildren().forEach((child) {
         _recursiveRemoveResource(child);
       });
     }
-  }
-
-  /**
-   * Shows the context menu under the menu disclosure button.
-   */
-  void _showMenu(FileItemCell cell,
-                 html.Element disclosureButton,
-                 Resource resource) {
-    // Position the context menu at the expected location.
-    html.Point position = getAbsolutePosition(disclosureButton);
-    position += new html.Point(0, disclosureButton.clientHeight - 2);
-    _showMenuAtLocation(cell, position, resource);
   }
 
   /**
@@ -644,13 +666,33 @@ class FilesController implements TreeViewDelegate {
   }
 
   /**
+   * Position the context menu at the expected location.
+   */
+  void _positionContextMenu(html.Point clickPoint, html.Element contextMenu) {
+    var topUi = html.document.querySelector("#topUi");
+    final int separatorHeight = 19;
+    final int itemHeight = 26;
+    int estimatedHeight = 12; // Start with value padding and border.
+    contextMenu.children.forEach((child) {
+      estimatedHeight += child.className == "divider" ? separatorHeight : itemHeight;
+    });
+
+    contextMenu.style.left = '${clickPoint.x}px';
+    if (estimatedHeight + clickPoint.y > topUi.offsetHeight) {
+      contextMenu.style.top = '${clickPoint.y - estimatedHeight}px';
+    } else {
+      contextMenu.style.top = '${clickPoint.y}px';
+    }
+  }
+
+  /**
    * Shows the context menu at given location.
    */
   void _showMenuAtLocation(FileItemCell cell,
                            html.Point position,
                            Resource resource) {
-    if (!_treeView.selection.contains(resource.path)) {
-      _treeView.selection = [resource.path];
+    if (!_treeView.selection.contains(resource.uuid)) {
+      _treeView.selection = [resource.uuid];
     }
 
     html.Element menuContainer = _delegate.getContextMenuContainer();
@@ -662,10 +704,7 @@ class FilesController implements TreeViewDelegate {
     // Get all applicable actions.
     List<ContextAction> actions = _delegate.getActionsFor(resources);
     fillContextMenu(contextMenu, actions, resources);
-
-    // Position the context menu at the expected location.
-    contextMenu.style.left = '${position.x}px';
-    contextMenu.style.top = '${position.y}px';
+    _positionContextMenu(position, contextMenu);
 
     // Show the menu.
     bootjack.Dropdown dropdown = bootjack.Dropdown.wire(contextMenu);

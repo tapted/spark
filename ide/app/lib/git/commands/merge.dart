@@ -7,6 +7,7 @@ library git.commands.merge;
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../diff3.dart';
 import '../object.dart';
 import '../object_utils.dart';
 import '../objectstore.dart';
@@ -16,6 +17,7 @@ class MergeItem {
   TreeEntry ours;
   TreeEntry base;
   TreeEntry theirs;
+  String conflictText;
   bool isConflict;
 
   MergeItem(this.ours, this.base, this.theirs, [this.isConflict = false]);
@@ -33,14 +35,14 @@ class TreeDiffResult {
  */
 class Merge {
 
-  bool shasEqual(List<int> sha1, List<int> sha2) {
+  static bool shasEqual(List<int> sha1, List<int> sha2) {
     for (var i = 0; i < sha1.length; ++i) {
       if (sha1[i] != sha2[i]) return false;
     }
     return true;
   }
 
-  dynamic _diff3(blob1, blob2, blob3) {
+  static dynamic _diff3(blob1, blob2, blob3) {
     return new Uint8List(0);
   }
 
@@ -59,8 +61,10 @@ class Merge {
     List merges = [];
 
     while (true) {
-      TreeEntry newEntry = newEntries[newIdx];
-      TreeEntry oldEntry = newEntries[oldIdx];
+      TreeEntry newEntry = newIdx < newEntries.length ? newEntries[newIdx]
+          : null;
+      TreeEntry oldEntry = oldIdx < oldEntries.length ? oldEntries[oldIdx]
+          : null;
 
       if (newEntry == null) {
         if (oldEntry == null ) {
@@ -88,8 +92,8 @@ class Merge {
     return new TreeDiffResult(adds, removes, merges);
   }
 
-  Future mergeTrees(ObjectStore store, TreeObject ourTree, TreeObject baseTree,
-      TreeObject theirTree) {
+  static Future<String> mergeTrees(ObjectStore store, TreeObject ourTree,
+      TreeObject baseTree, TreeObject theirTree) {
     List<TreeEntry> finalTree = [];
     List merges = [];
     var next = null;
@@ -143,6 +147,8 @@ class Merge {
                   == next.isBlob)) {
                 if (shasEqual(next.sha, baseEntry.sha)) {
                   finalTree.add(theirEntry);
+                } else if (shasEqual(baseEntry.sha, theirEntry.sha)){
+                  finalTree.add(next);
                 } else {
                   merges.add(new MergeItem(next, baseEntry, theirEntry));
                 }
@@ -197,20 +203,22 @@ class Merge {
         if (item.ours.isBlob) {
           return store.retrieveObjectBlobsAsString(shas).then(
               (List<LooseObject> blobs) {
-            var newBlob = _diff3(blobs[0].data, blobs[1].data, blobs[2].data);
-            if (newBlob.conflict) {
-              conflicts.add(newBlob);
-              return null;
+            Diff3Result diffResult = Diff3.diff(blobs[0].data,
+                blobs[1].data, blobs[2].data);
+            if (diffResult.conflict) {
+              item.conflictText = diffResult.text;
+              conflicts.add(item);
+              return conflicts;
             } else {
-              return store.writeRawObject('blob', '').then((String sha) {
+              return getShaForString(diffResult.text, 'blob').then((String sha) {
                 item.ours.sha = shaToBytes(sha);
                 finalTree.add(item.ours);
-                return null;
+                return [];
               });
             }
           });
         } else {
-          return store.retrieveObjectList(shas, ObjectTypes.TREE).then(
+          return store.retrieveObjectList(shas, ObjectTypes.TREE_STR).then(
               (List<TreeObject> trees) {
             return mergeTrees(store, trees[0], trees[1], trees[2]).then(
                 (String mergedSha) {
@@ -219,7 +227,7 @@ class Merge {
               return null;
             }, onError: (List<MergeItem> newConflicts) {
               conflicts.addAll(newConflicts);
-              return null;
+              return [];
             });
           });
         }
@@ -227,7 +235,6 @@ class Merge {
       if (conflicts.isEmpty) {
         return store.writeTree(finalTree);
       } else {
-        //TODO error(conflicts);
         return new Future.error(conflicts);
       }
     });

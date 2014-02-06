@@ -13,7 +13,6 @@ import '../common/spark_widget.dart';
 
 typedef void SplitterUpdateFunction(int position);
 
-/// Implements the spark-splitter custom Polymer element.
 @CustomTag('spark-splitter')
 class SparkSplitter extends SparkWidget {
   /// Possible values are "left", "right", "up" and "down".
@@ -22,7 +21,11 @@ class SparkSplitter extends SparkWidget {
   /// 2) which sibling will be continuously auto-resized when the splitter is
   ///    dragged.
   @published String direction = 'left';
-  /// Locks the split bar so it can't be dragged.
+  /// Height or width of the split bar, depending on the direction.
+  @published int size = 8;
+  /// Whether to show a drag handle image within the split bar.
+  @published bool handle = true;
+  /// Whether to lock the split bar so it can't be dragged.
   @published bool locked = false;
   /// Get notified of position changes.
   @published SplitterUpdateFunction onUpdate;
@@ -76,6 +79,8 @@ class SparkSplitter extends SparkWidget {
   /// Triggered when the control is first displayed.
   @override
   void enteredView() {
+    super.enteredView();
+
     // TODO(sergeygs): Perhaps switch to using onDrag* instead of onMouse* once
     // support for drag-and-drop in shadow DOM is fixed. It is less important
     // here, because the element is not actually supposed to be dropped onto
@@ -89,11 +94,44 @@ class SparkSplitter extends SparkWidget {
   /// Triggered when [direction] is externally changed.
   // NOTE: The name must be exactly like this -- do not change.
   void directionChanged() {
-    _isHorizontal = direction == 'up' || direction == 'down';
     _isTargetNextSibling = direction == 'right' || direction == 'down';
+    _isHorizontal = direction == 'up' || direction == 'down';
     _target =
         _isTargetNextSibling ? nextElementSibling : previousElementSibling;
+    // If we're enclosed in another element and sandwiched between its
+    // <content> tags, we recursively delve into the distributed nodes of
+    // the target <content> in order to find the true target to resize.
+    while (_target is ContentElement) {
+      final List<Node> distrNodes =
+          (_target as ContentElement).getDistributedNodes();
+      _target = _isTargetNextSibling ? distrNodes.first : distrNodes.last;
+    }
     classes.toggle('horizontal', _isHorizontal);
+    _setThickness();
+    if (handle) {
+      _addBackgroundHandle();
+    }
+  }
+
+  void _setThickness() {
+    final sizeStr = '${size}px';
+    if (_isHorizontal) {
+      this.style.height = sizeStr;
+      this.style.width = "auto";
+    } else {
+      this.style.height = "auto";
+      this.style.width = sizeStr;
+    }
+  }
+
+  void _addBackgroundHandle() {
+    if (_isHorizontal) {
+      classes.add('horizontal-handle');
+      classes.remove('vertical-handle');
+    } else {
+      classes.remove('horizontal-handle');
+      classes.add('vertical-handle');
+    }
   }
 
   /// Cache the current size of the target.

@@ -4,8 +4,6 @@
 
 library spark_widgets.button;
 
-import 'dart:html';
-
 import 'package:polymer/polymer.dart';
 
 import '../common/spark_widget.dart';
@@ -24,6 +22,7 @@ class SparkButton extends SparkWidget {
 
   @published bool large = false;
   @published bool small = false;
+  @published bool noPadding = false;
 
   String get actionId => attributes['action-id'];
 

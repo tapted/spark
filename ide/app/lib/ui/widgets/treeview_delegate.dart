@@ -50,7 +50,7 @@ abstract class TreeViewDelegate {
 
   /**
    * The implementation of this method will be triggered when a node is
-   * clicked.  Returning false will cancel further selection operations. 
+   * clicked.  Returning false will cancel further selection operations.
    */
   bool treeViewRowClicked(Event event, String uid);
 
@@ -102,7 +102,7 @@ abstract class TreeViewDelegate {
    */
   bool treeViewAllowsDropCells(TreeView view,
                                List<String> nodesUIDs,
-                               String destinationNodeUID) {}
+                               String destinationNodeUID) => false;
 
   /**
    * This method is called when the user dropped an external item to one of its
@@ -112,7 +112,7 @@ abstract class TreeViewDelegate {
    */
   bool treeViewAllowsDrop(TreeView view,
                           DataTransfer dataTransfer,
-                          String destinationNodeUID) {}
+                          String destinationNodeUID) => false;
 
   /**
    * This method provides a drag image and location for the given nodes UIDs.

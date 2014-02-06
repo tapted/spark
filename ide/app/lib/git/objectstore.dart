@@ -14,7 +14,10 @@ import 'dart:typed_data';
 import 'package:chrome/chrome_app.dart' as chrome;
 import 'package:crypto/crypto.dart' as crypto;
 
+import 'config.dart';
+import 'constants.dart';
 import 'file_operations.dart';
+import 'commands/index.dart';
 import 'object.dart';
 import 'object_utils.dart';
 import 'pack.dart';
@@ -37,28 +40,10 @@ class GitRef {
   dynamic remote;
 
   GitRef(this.sha, this.name, [this.type, this.remote]);
-}
 
-class GitConfig {
+  String getPktLine() => '${sha} ${head} ${name}';
 
-  String url;
-  String shallow;
-  Map<String, String> remoteHeads = {};
-  DateTime time;
-
-  dynamic _jsonObject;
-
-
-  GitConfig([String configStr]) {
-    if (configStr != null) {
-      _jsonObject = JSON.decode(configStr);
-    }
-  }
-
-  String toString() {
-    //TODO return Json Object string.
-    return "";
-  }
+  String toString() => getPktLine();
 }
 
 class PackEntry {
@@ -66,6 +51,13 @@ class PackEntry {
   PackIndex packIdx;
 
   PackEntry(this.pack, this.packIdx);
+}
+
+class CommitPushEntry {
+  List<CommitObject> commits = [];
+  GitRef ref;
+
+  CommitPushEntry(this.commits, this.ref);
 }
 
 class FindPackedObjectResult {
@@ -99,8 +91,16 @@ class ObjectStore {
 
   List<PackEntry> packs = [];
 
+  Config config;
+
+  Index index;
+
+  chrome.DirectoryEntry get root => _rootDir;
+
   ObjectStore(chrome.DirectoryEntry root) {
     _rootDir = root;
+    index = new Index(this);
+    config = new Config();
   }
 
   loadWith(chrome.DirectoryEntry objectDir, List<PackEntry> packs) {
@@ -109,11 +109,11 @@ class ObjectStore {
   }
 
   Future load() {
-    return _rootDir.createDirectory(GIT_FOLDER_PATH).then((gitDir) {
-      return gitDir.createDirectory(OBJECT_FOLDER_PATH).then((objectsDir) {
+    return _rootDir.getDirectory(GIT_FOLDER_PATH).then((gitDir) {
+      return gitDir.getDirectory(OBJECT_FOLDER_PATH).then((objectsDir) {
 
         objectDir = objectsDir;
-        return objectsDir.createDirectory('pack').then((
+        return objectsDir.getDirectory('pack').then((
             chrome.DirectoryEntry packDir) {
           return FileOps.listFiles(packDir).then((List<chrome.Entry> entries) {
             Iterable<chrome.Entry> packEntries = entries.where((e)
@@ -121,6 +121,8 @@ class ObjectStore {
 
             return Future.forEach(packEntries, (chrome.Entry entry) {
               _readPackEntry(packDir, entry);
+            }).then((_) {
+              return _initHelper();
             });
           });
         });
@@ -141,7 +143,8 @@ class ObjectStore {
   }
 
   Future<String> getHeadRef() {
-    return _rootDir.getFile(gitPath + HEAD_PATH).then((chrome.ChromeFileEntry entry) {
+    return _rootDir.getFile(gitPath + HEAD_PATH).then(
+        (chrome.ChromeFileEntry entry) {
       return entry.readBytes().then((chrome.ArrayBuffer buffer) {
         String content = UTF8.decode(buffer.getBytes());
         // get rid of the initial 'ref: ' plus newline at end.
@@ -166,6 +169,12 @@ class ObjectStore {
 
   Future<String> getHeadForRef(String headRefName) {
     return FileOps.readFile(_rootDir, gitPath + headRefName, "Text")
+      .then((String content) => content.substring(0, 40));
+  }
+
+  Future<String> getRemoteHeadForRef(String headRefName) {
+    String path = gitPath + REFS_REMOTE_HEADS + headRefName.split('/').last;
+    return FileOps.readFile(_rootDir, path, "Text")
       .then((String content) => content.substring(0, 40));
   }
 
@@ -200,7 +209,7 @@ class ObjectStore {
   Future<chrome.FileEntry> _findLooseObject(String sha) => objectDir.getFile(
       sha.substring(0, 2) + '/' + sha.substring(2));
 
-  FindPackedObjectResult _findPackedObject(Uint8List shaBytes) {
+  FindPackedObjectResult findPackedObject(List<int> shaBytes) {
     for (var i = 0; i < packs.length; ++i) {
       int offset = packs[i].packIdx.getObjectOffset(shaBytes);
 
@@ -213,12 +222,20 @@ class ObjectStore {
   }
 
   Future<GitObject> retrieveObject(String sha, String objType) {
-    String dataType = (objType == ObjectTypes.COMMIT ? "Text" : "ArrayBuffer");
-    return retrieveRawObject(sha, dataType).then(
-        (LooseObject object) => GitObject.make(sha, objType, object.data));
+    String dataType = (objType == ObjectTypes.COMMIT_STR ? "Text"
+        : "ArrayBuffer");
+    return retrieveRawObject(sha, dataType).then((object) {
+      if (objType == 'Raw') {
+        return object;
+      } else if (object is LooseObject) {
+        return GitObject.make(sha, objType, object.data, object);
+      } else {
+        return GitObject.make(sha, objType, object.data);
+      }
+    });
   }
 
-  Future retrieveRawObject(dynamic sha, String dataType) {
+  Future<GitObject> retrieveRawObject(dynamic sha, String dataType) {
     Uint8List shaBytes;
     if (sha is Uint8List) {
       shaBytes = sha;
@@ -243,9 +260,20 @@ class ObjectStore {
       });
     }, onError:(e) {
       try {
-        FindPackedObjectResult obj = this._findPackedObject(shaBytes);
+        FindPackedObjectResult obj = this.findPackedObject(shaBytes);
         dataType = dataType == 'Raw' ? 'ArrayBuffer' : dataType;
-        return obj.pack.matchAndExpandObjectAtOffset(obj.offset, dataType);
+        return obj.pack.matchAndExpandObjectAtOffset(obj.offset, dataType).then(
+            (PackedObject packed) {
+          if (dataType == 'Text') {
+            return FileOps.readBlob(new Blob([packed.data]), 'Text').then(
+                (String data) {
+              packed.data = data;
+              return packed;
+            });
+          } else {
+            return packed;
+          }
+        });
       } catch (e) {
         throw "Can't find object with SHA " + sha;
       }
@@ -253,7 +281,7 @@ class ObjectStore {
   }
 
 
-  Future<CommitGraph> getCommitGraph(List<String> headShas, int limit) {
+  Future<CommitGraph> getCommitGraph(List<String> headShas, [int limit]) {
     List<CommitObject> commits = [];
     Map<String, bool> seen = {};
 
@@ -267,7 +295,8 @@ class ObjectStore {
 
         seen[sha] = true;
 
-        return retrieveObject(sha, ObjectTypes.COMMIT).then((CommitObject commitObj) {
+        return retrieveObject(sha, ObjectTypes.COMMIT_STR).then(
+            (CommitObject commitObj) {
           nextLevel.addAll(commitObj.parents);
           int i = commits.length - 1;
           for (; i >= 0; i--) {
@@ -281,19 +310,76 @@ class ObjectStore {
           }
 
           return null;
+        }).catchError((e) => null);
       }).then((_) {
-
-        if (commits.length >= limit || nextLevel.length == 0) {
+        if ((limit != null && commits.length >= limit) ||
+            nextLevel.length == 0) {
           return new Future.value(new CommitGraph(commits, nextLevel));
         } else {
           return walkLevel(nextLevel);
         }
       });
-      });
     }
     return walkLevel(headShas).then((_) => new CommitGraph(commits, []));
   }
 
+  /**
+   * Returns the lowest common ancestor for the given [headShas].
+   */
+  Future<String> getCommonAncestor(List<String> headShas) {
+    List<CommitObject> commits = [];
+    Map<String, List> seen = {};
+
+    List nodes = [];
+    headShas.forEach((headSha) {
+      nodes.add({"sha": headSha, "head" : headSha});
+    });
+
+    String ancestor;
+    Future<String> walkLevel(List nodes) {
+    List<Map> nextLevel = [];
+      return Future.forEach(nodes, (Map node) {
+        // Already found the lowest common ancestor.
+        if (ancestor != null) {
+          return null;
+        }
+
+        String sha = node["sha"];
+        if (seen[sha] != null) {
+          if (!seen[sha].any((String head) => node["head"] == head)) {
+            seen[sha].add(node["head"]);
+            if (seen[sha].length == headShas.length) {
+              ancestor = sha;
+            }
+          }
+          return null;
+        }
+
+        seen[sha] = [node["head"]];
+
+        return retrieveObject(sha, ObjectTypes.COMMIT_STR).then(
+            (CommitObject commitObj) {
+          commitObj.parents.forEach((String parent) {
+            nextLevel.add({"sha" : parent, "head" : node["head"]});
+          });
+        }).catchError((e) => null);
+      }).then((_) {
+        if (nextLevel.length == 0) {
+          if (ancestor == null) {
+            throw "error in finding common ancestor.";
+          } else {
+            return ancestor;
+          }
+        } else {
+          if (ancestor != null) {
+            return ancestor;
+          }
+          return walkLevel(nextLevel);
+        }
+      });
+    }
+    return walkLevel(nodes);
+  }
 
   _nonFastForward() {
     //TODO throw some error.
@@ -302,20 +388,22 @@ class ObjectStore {
   Future<CommitObject> _checkRemoteHead(GitRef remoteRef) {
     // Check if the remote head exists in the local repo.
     if (remoteRef.sha != HEAD_MASTER_SHA) {
-      return retrieveObject(remoteRef.sha, ObjectTypes.COMMIT).then((obj) => obj,
-          onError: (e) {
-            //TODO support non-fast forward.
-            _nonFastForward();
-            throw(e);
+      return retrieveObject(remoteRef.sha, ObjectTypes.COMMIT_STR).then(
+          (obj) => obj,
+        onError: (e) {
+          //TODO support non-fast forward.
+          _nonFastForward();
+          throw(e);
       });
     }
-    return null;
+    return new Future.value();
   }
 
 
-  Future getCommitsForPush(List<GitRef> baseRefs, Map<String, String> remoteHeads) {
+  Future<CommitPushEntry> getCommitsForPush(List<GitRef> baseRefs,
+      Map<String, String> remoteHeads) {
     // special case of empty remote.
-    if (baseRefs.length == 1 && baseRefs[0].sha == HEAD_MASTER_SHA) {
+    if (baseRefs.length == 1 && baseRefs.first.sha == HEAD_MASTER_SHA) {
       baseRefs[0].name = HEAD_MASTER_REF_PATH;
     }
 
@@ -323,9 +411,9 @@ class ObjectStore {
     GitRef remoteRef, headRef;
     return getHeadRef().then((String headRefName) {
       remoteRef = baseRefs.firstWhere((GitRef ref) => ref.name == headRefName);
-      Map<String, bool> remoteShas;
+      Map<String, bool> remoteShas = {};
       // Didn't find a remote branch for the local branch.
-      if (remoteHeads.isNotEmpty) {
+      if (remoteRef == null) {
         remoteRef.name = 'headRef';
         remoteRef.sha = HEAD_MASTER_SHA;
 
@@ -333,7 +421,6 @@ class ObjectStore {
           remoteShas[sha] = true;
         });
       }
-
       return _checkRemoteHead(remoteRef).then((_) {
         return getHeadForRef(headRefName).then((String sha) {
           if (sha == remoteRef.sha) {
@@ -342,7 +429,6 @@ class ObjectStore {
           }
 
           remoteRef.head = sha;
-          remoteRef.sha = sha;
 
          //TODO handle case of new branch with no commits.
 
@@ -352,32 +438,33 @@ class ObjectStore {
 
         }, onError: (e) {
           // no commits to push.
-          // TODO throw error.
+          throw "no commits to push.";
         });
       });
     });
   }
 
-  Future _getCommits(GitRef remoteRef, Map<String, bool> remoteShas,
-      String sha) {
+  Future<CommitPushEntry> _getCommits(GitRef remoteRef, Map<String, bool>
+      remoteShas, String sha) {
     var commits = [];
-    Future getNextCommit(String sha) {
+    Future<CommitPushEntry> getNextCommit(String sha) {
 
-      //TODO return retrieveObject result
-      return retrieveObject(sha, ObjectTypes.COMMIT).then((CommitObject commitObj) {
-        var rawObj;
+      return retrieveObject(sha, ObjectTypes.COMMIT_STR).then((
+          CommitObject commitObj) {
+
         Completer completer = new Completer();
-        commits.add({ObjectTypes.COMMIT: commitObj, "raw": rawObj});
+        commits.add(commitObj);
+
         if (commitObj.parents.length > 1) {
           // this means a local merge commit.
           _nonFastForward();
           completer.completeError("");
-        } else if (commitObj.parents.length == 0 ||
-            commitObj.parents[0] == remoteRef.sha || remoteShas[commitObj.parents[0]]) {
-          //TODO callback commits, remoteRef;
-          completer.complete();
+        } else if (commitObj.parents.length == 0
+            || commitObj.parents.first == remoteRef.sha
+            || remoteShas[commitObj.parents[0]]) {
+          completer.complete(new CommitPushEntry(commits, remoteRef));
         } else {
-          return getNextCommit(commitObj.parents[0]);
+          return getNextCommit(commitObj.parents.first);
         }
 
         return completer.future;
@@ -389,10 +476,10 @@ class ObjectStore {
     return getNextCommit(sha);
   }
 
-  Future retrieveObjectBlobsAsString(List<String> shas) {
-    List blobs;
+  Future<List<LooseObject>> retrieveObjectBlobsAsString(List<String> shas) {
+    List<LooseObject> blobs = [];
     return Future.forEach(shas, (String sha) {
-      retrieveRawObject(sha, 'Text').then((blob) => blobs.add(blob));
+      return retrieveRawObject(sha, 'Text').then((blob) => blobs.add(blob));
     }).then((_) => blobs);
   }
 
@@ -422,8 +509,9 @@ class ObjectStore {
         gitPath + OBJECT_FOLDER_PATH).then((chrome.DirectoryEntry objectDir) {
       this.objectDir = objectDir;
       return FileOps.createFileWithContent(_rootDir, gitPath + HEAD_PATH,
-          'ref: refs/heads/master\n', 'Text').then((entry) => entry,
-          onError: (e) {
+          'ref: refs/heads/master\n', 'Text').then((entry)  {
+            return _initHelper();
+          }, onError: (e) {
             print(e);
             throw e;
           });
@@ -432,9 +520,19 @@ class ObjectStore {
     });
   }
 
+  Future _initHelper() {
+    return index.init().then((_) {
+      return readConfig().then((Config config) {
+        this.config = config;
+        return new Future.value();
+      });
+    });
+  }
+
   Future<TreeObject> _getTreeFromCommitSha(String sha) {
-    return retrieveObject(sha, ObjectTypes.COMMIT).then((CommitObject commit) {
-     return  retrieveObject(commit.treeSha, ObjectTypes.TREE).then(
+    return retrieveObject(sha, ObjectTypes.COMMIT_STR).then(
+        (CommitObject commit) {
+     return  retrieveObject(commit.treeSha, ObjectTypes.TREE_STR).then(
          (rawObject) => rawObject);
     });
   }
@@ -494,7 +592,7 @@ class ObjectStore {
       Uint8List digest = new Uint8List.fromList(sha1.close());
 
       try {
-        FindPackedObjectResult obj = _findPackedObject(digest);
+        FindPackedObjectResult obj = findPackedObject(digest);
         completer.complete(shaBytesToString(digest));
       } catch (e) {
         Future<String> str = _storeInFile(shaBytesToString(digest), data).then(
@@ -551,32 +649,19 @@ class ObjectStore {
       blobParts.add(tree.sha);
     });
 
-    return writeRawObject(ObjectTypes.TREE, new Blob(blobParts));
+    return writeRawObject(ObjectTypes.TREE_STR, new Blob(blobParts));
   }
 
-  Future<GitConfig> getConfig() {
+  Future<Config> readConfig() {
     return FileOps.readFile(_rootDir, '.git/config.json', 'Text').then(
-        (String configStr) => new GitConfig(configStr),
+        (String configStr) => new Config(configStr),
       // TODO: handle errors / build default GitConfig.
-      onError: (e) => new GitConfig());
+      onError: (e) => this.config);
   }
 
-  Future<Entry> setConfig(GitConfig config) {
-    String configStr = config.toString();
+  Future<Entry> writeConfig() {
+    String configStr = config.toJson();
     return FileOps.createFileWithContent(_rootDir, '.git/config.json',
         configStr, 'Text');
-  }
-
-  Future<Entry> updateLastChange(GitConfig config) {
-    Future<Entry> doUpdate(GitConfig config) {
-      return new Future.value();
-      config.time = new DateTime.now();
-      return setConfig(config);
-    }
-    if (config != null) {
-      return doUpdate(config);
-    }
-    return new Future.value();
-    //return this.getConfig().then((GitConfig config) => doUpdate(config));
   }
 }

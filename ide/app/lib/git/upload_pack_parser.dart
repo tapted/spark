@@ -11,6 +11,7 @@ import 'dart:html';
 import 'dart:typed_data';
 
 import 'file_operations.dart';
+import 'object.dart';
 import 'objectstore.dart';
 import 'pack.dart';
 
@@ -23,7 +24,7 @@ class PktLine {
 }
 
 class PackParseResult {
-  List<PackObject> objects;
+  List<PackedObject> objects;
   String shallow;
   List<String> common;
   Uint8List data;
@@ -49,7 +50,6 @@ class UploadPackParser {
     var packFileParser;
     String remoteLine = "";
     bool gotAckorNak = false;
-    String ackRegex = "ACK ([0-9a-fA-F]{40}) common";
     List<String> common = [];
 
     String pktLineStr = _getPktLine(pktLine);
@@ -62,9 +62,10 @@ class UploadPackParser {
 
     while (pktLineStr == "NAK\n" || (pktLineStr.length > 3
         && pktLineStr.substring(0,3) == "ACK")) {
-      List<Match> matches = ackRegex.allMatches(pktLineStr);
+      RegExp ackRegex = new RegExp(r"ACK ([0-9a-fA-F]{40}) common");
+      Iterable<Match> matches = ackRegex.allMatches(pktLineStr);
       if (matches.isNotEmpty) {
-        common.add(matches[1].group(0));
+        common.add(matches.first.group(1));
       }
       pktLine = _nextPktLine();
       pktLineStr = _getPktLine(pktLine);
