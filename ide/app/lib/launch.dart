@@ -13,8 +13,8 @@ import 'dart:js' as js;
 import 'dart:typed_data' as typed_data;
 
 import 'package:chrome/chrome_app.dart' as chrome;
-import 'package:js/js.dart' as js;
 import 'package:intl/intl.dart';
+import 'package:js/js.dart' as jsPackage;
 import 'package:logging/logging.dart';
 import 'package:tavern/tavern.dart' as tavern;
 
@@ -144,10 +144,11 @@ class ChromeAppLaunchDelegate extends LaunchDelegate {
   void run(Resource resource) {
     if (resource.name == 'pubspec.yaml') {
       resource.entry.getParent().then((parent) {
-        tavern.getDependencies(parent, js.context.logMessage);
+        tavern.getDependencies(parent, jsPackage.context.logMessage);
       });
       return;
     }
+
     print('TODO: run project ${resource.project}');
     if (!isDart2js()) {
       return;
