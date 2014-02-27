@@ -21,7 +21,8 @@
   "permissions": [
     "https://www.google-analytics.com/",
     "https://github.com/*",
-    "http://tapted-z620-l.syd.corp.google.com:8080/*",
+    "https://pub.dartlang.org/*",
+    "https://commondatastorage.googleapis.com/*",
     "clipboardRead",
     "clipboardWrite",
     "developerPrivate",
